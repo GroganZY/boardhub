@@ -66,7 +66,7 @@ If running manually from Terminal instead of `launchd` (stop any active LaunchAg
 
 Phase 1 keeps all agents (`codex`, `dsh`, `claude_main`, `claude_side`, `claude`, `gpt`, and the configured human role, default `owner`) on file inboxes and defaults `gemini` to inbox-only as well.
 
-After confirming inbox-only operation and verifying your external broker client (`agy_client.py probe`) against your standing Gemini conversation ID:
+After confirming inbox-only operation and verifying your external broker client (`agy_client.py probe`) against your standing Gemini conversation ID (ensure your external `agy_client.py` reports `broker_unavailable` only on pre-dispatch connection failures, never post-connect I/O or timeout errors; upgrading `WakeLedger.load()` automatically marks pre-v0.1.2 pending retries as `uncertain`):
 
 1. Create `<runtime_dir>/routes.json` (`0600`) pinning your exact Gemini `conversation_id` and `agy_client_path`:
 

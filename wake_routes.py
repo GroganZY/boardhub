@@ -43,6 +43,7 @@ else:
 
 
 SCHEMA_VERSION = 2
+RETRY_SEMANTICS_VERSION = 2
 VALID_OUTCOMES = ("accepted", "not_sent", "uncertain", "disabled")
 VALID_ADAPTERS = ("inbox", "gemini_agy")
 DEFAULT_PYTHON_BIN = os.environ.get("BOARDHUB_PYTHON_BIN", "").strip() or "/usr/bin/python3"
@@ -408,8 +409,13 @@ class WakeLedger:
         ):
             return cls(path, cls._empty_state()), True
 
+        retry_sem_ver = obj.get("retry_semantics_version", 1)
+        if isinstance(retry_sem_ver, bool) or not isinstance(retry_sem_ver, int) or retry_sem_ver < 1:
+            return cls(path, cls._empty_state()), True
+
         now_str = board_lint.format_utc_rfc3339(now or datetime.now(timezone.utc))
         dirty = False
+        needs_legacy_retry_migration = retry_sem_ver < RETRY_SEMANTICS_VERSION
         records = obj["records"]
         for key, rec in records.items():
             if not isinstance(key, str) or not isinstance(rec, dict):
@@ -424,6 +430,21 @@ class WakeLedger:
                     attempts[-1]["reason_code"] = "interrupted_attempt"
                     attempts[-1]["finished_at"] = now_str
                 dirty = True
+            elif needs_legacy_retry_migration and rec.get("status") == "not_sent" and rec.get("transient_retryable"):
+                # Pre-v0.1.2 records may reflect post-send I/O errors misclassified as broker_unavailable.
+                # Mark pending retries uncertain on upgrade while preserving attempt history for review.
+                rec["status"] = "uncertain"
+                rec["transient_retryable"] = False
+                rec["retry_after"] = None
+                rec["operator_action_required"] = True
+                rec["legacy_migrated_reason"] = rec.get("last_reason_code")
+                rec["legacy_migrated_at"] = now_str
+                rec["last_reason_code"] = "legacy_retry_uncertain"
+                dirty = True
+
+        if needs_legacy_retry_migration:
+            obj["retry_semantics_version"] = RETRY_SEMANTICS_VERSION
+            dirty = True
 
         ledger = cls(path, obj)
         if dirty:
@@ -434,6 +455,7 @@ class WakeLedger:
     def _empty_state() -> dict:
         return {
             "version": SCHEMA_VERSION,
+            "retry_semantics_version": RETRY_SEMANTICS_VERSION,
             "records": {},
             "route_baselines": {},
         }
@@ -775,9 +797,6 @@ class MailLedger:
     def save(self) -> None:
         payload = (json.dumps(self.state, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
         board_lint.atomic_write_private_file(self.path, payload, mode=0o600)
-        marker = self.path.parent / WAKE_LEDGER_INIT_MARKER
-        if not marker.exists() and not marker.is_symlink():
-            board_lint.atomic_write_private_file(marker, b"initialized\n", mode=0o600)
 
     def begin_submission(self, item_ids: List[str], snapshot_id: str, now: Optional[datetime] = None) -> str:
         if not item_ids or any(not isinstance(i, str) or not i for i in item_ids):

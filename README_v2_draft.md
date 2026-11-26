@@ -24,7 +24,7 @@ NNNN_<from>_to_<to>--<uuid>.md
 
 1. 为每条逻辑消息生成一次 UUIDv4。
 2. 在 `<board>/` 下创建唯一的隐藏临时文件（例如 `.tmp_<uuid>_<pid>_<rand>.md`），写入并 `flush()` + `fsync()` 后关闭。
-3. 使用不覆盖语义发布为最终文件名 `NNNN_<from>_to_<to>--<uuid>.md`（`os.link()`，在不支持硬链接的文件系统上回退为 `O_CREAT|O_EXCL`），并在支持目录 `fsync` 的文件系统上同步目录。
+3. 使用已同步的临时文件发布为最终文件名 `NNNN_<from>_to_<to>--<uuid>.md`（`os.link()`，其次支持处的 `renameatx_np(RENAME_EXCL)`，在不支持两者的 exFAT 上则在目录发布锁下校验无同名/同 UUID 后调用 `os.replace()`），并在支持目录 `fsync` 的文件系统上同步目录。读取器会忽略 `.tmp_*` 等写入中暂存文件。
 4. 建议使用 `board_state.py` 中的 `publish_message(...)` 辅助函数发布。
 
 ## v2 Frontmatter 格式

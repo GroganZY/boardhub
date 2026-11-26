@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import random
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -687,6 +689,158 @@ class ReplayTasksPausesTests(unittest.TestCase):
         by_file = {d["file"]: d["code"] for d in res["lint"]["diagnostics"]}
         self.assertEqual(by_file[f"0004_claude_main_to_dsh--{u_dup}.md"], "FORMAT")
         self.assertEqual(by_file[f"0005_claude_main_to_dsh--{u_miss}.md"], "FORMAT")
+
+    def test_exfat_fallback_publishes_synced_temp_file_never_half_written(self):
+        # 1. Hardlink unsupported -> Darwin renameatx_np(RENAME_EXCL) publishes atomically without overwrite
+        u_ren = make_uuid(990)
+        b_ren1 = build_v2_md("claude_main", "dsh", "info", u_ren, u_ren, body="rename noreplace 1")
+        b_ren2 = build_v2_md("claude_main", "dsh", "info", u_ren, u_ren, body="rename noreplace 2")
+        final_ren = self.board / f"0001_claude_main_to_dsh--{u_ren}.md"
+        with mock.patch.object(board_state.os, "link", side_effect=OSError(errno.ENOTSUP, "not supported")):
+            with self.assertRaises(board_state.RequestConflictError):
+                board_state.publish_message(
+                    self.board, 1, "claude_main", "dsh", u_ren, b_ren2,
+                    _before_publish_hook=lambda: final_ren.write_bytes(b_ren1),
+                )
+            self.assertEqual(final_ren.read_bytes(), b_ren1)
+
+        # 2. Neither hardlink nor RENAME_EXCL supported (macOS exFAT):
+        #    (a) staging/temp files ignored by scan_board, (b) mid-write crash leaves no 0-byte final file,
+        #    (c) retry succeeds, and (d) existing final file is never overwritten.
+        u_ex = make_uuid(991)
+        b_ex1 = build_v2_md("claude_main", "dsh", "info", u_ex, u_ex, body="exfat safe body")
+        b_ex2 = build_v2_md("claude_main", "dsh", "info", u_ex, u_ex, body="exfat conflicting body")
+        final_ex = self.board / f"0002_claude_main_to_dsh--{u_ex}.md"
+
+        # Staging filenames still being written must be ignored by readers
+        (self.board / "0003_claude_main_to_dsh.tmp.md").write_bytes(b"half")
+        (self.board / "tmp_0004_claude_main_to_dsh.md").write_bytes(b"half")
+        (self.board / "0005_claude_main_to_dsh.part.md").write_bytes(b"half")
+        observed_during_write = []
+
+        def interrupt_during_fsync(_fd):
+            observed_during_write.append(final_ex.exists())
+            snap_mid = board_lint.scan_board(self.board)
+            observed_during_write.append(snap_mid.healthy)
+            observed_during_write.append(list(snap_mid.entries.keys()))
+            raise OSError(errno.EIO, "simulated mid-write crash")
+
+        with (
+            mock.patch.object(board_state.os, "link", side_effect=OSError(errno.ENOTSUP, "not supported")),
+            mock.patch.object(board_state, "_rename_noreplace", side_effect=OSError(errno.ENOTSUP, "not supported")),
+        ):
+            with self.assertRaises(board_state.DurabilityError):
+                board_state.publish_message(
+                    self.board, 2, "claude_main", "dsh", u_ex, b_ex1,
+                    _fsync_file_fn=interrupt_during_fsync,
+                )
+            self.assertEqual(observed_during_write[0], False)
+            self.assertEqual(observed_during_write[1], True)
+            self.assertNotIn(final_ex.name, observed_during_write[2])
+            self.assertNotIn("0003_claude_main_to_dsh.tmp.md", observed_during_write[2])
+            self.assertNotIn("tmp_0004_claude_main_to_dsh.md", observed_during_write[2])
+            self.assertNotIn("0005_claude_main_to_dsh.part.md", observed_during_write[2])
+            self.assertFalse(final_ex.exists())
+            self.assertEqual([p.name for p in self.board.iterdir() if p.name.startswith(".tmp_")], [])
+
+            # Same-UUID retry succeeds cleanly after interrupted temp write
+            res_ok = board_state.publish_message(self.board, 2, "claude_main", "dsh", u_ex, b_ex1)
+            self.assertEqual(res_ok["status"], "published")
+            self.assertEqual(final_ex.read_bytes(), b_ex1)
+
+            # Competing write with different bytes raises RequestConflictError without overwriting
+            with self.assertRaises(board_state.RequestConflictError):
+                board_state.publish_message(
+                    self.board, 2, "claude_main", "dsh", u_ex, b_ex2,
+                    _before_publish_hook=lambda: None,
+                )
+            self.assertEqual(final_ex.read_bytes(), b_ex1)
+
+    def test_cross_process_publish_same_uuid_different_number_serializes(self):
+        worker = (
+            "import importlib.util, json, sys; from pathlib import Path\n"
+            "hub = Path(sys.argv[1]); board = Path(sys.argv[2]); num = int(sys.argv[3]); "
+            "uid = sys.argv[4]; body = sys.argv[5]\n"
+            "def ld(n):\n"
+            "    s = importlib.util.spec_from_file_location(n, str(hub / f'{n}.py'))\n"
+            "    m = importlib.util.module_from_spec(s); sys.modules[n] = m; s.loader.exec_module(m); return m\n"
+            "ld('board_lint'); bs = ld('board_state')\n"
+            "raw = f'---\\nv: 2\\nfrom: claude_main\\nto: dsh\\ntype: info\\nrequest_id: {uid}\\nthread: {uid}\\nprev: none\\nsent_at: 2026-11-26T03:00:00Z\\nneeds_user: no\\n---\\n\\n{body}\\n'.encode('utf-8')\n"
+            "try:\n"
+            "    r = bs.publish_message(board, num, 'claude_main', 'dsh', uid, raw)\n"
+            "    print(json.dumps({'ok': True, 'status': r['status'], 'filename': r['filename']}))\n"
+            "except bs.RequestConflictError as exc:\n"
+            "    print(json.dumps({'ok': False, 'error': type(exc).__name__}))\n"
+        )
+        # 1. Same UUID, identical bytes, different numbers across two processes -> only 1 file created
+        u_same = make_uuid(992)
+        p1 = subprocess.Popen(
+            [sys.executable, "-B", "-c", worker, str(HUB_DIR), str(self.board), "10", u_same, "identical"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        p2 = subprocess.Popen(
+            [sys.executable, "-B", "-c", worker, str(HUB_DIR), str(self.board), "11", u_same, "identical"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        out1, err1 = p1.communicate(timeout=10)
+        out2, err2 = p2.communicate(timeout=10)
+        self.assertEqual(p1.returncode, 0, err1)
+        self.assertEqual(p2.returncode, 0, err2)
+        r1, r2 = json.loads(out1), json.loads(out2)
+        self.assertEqual(sorted([r1["status"], r2["status"]]), ["idempotent_ok", "published"])
+        self.assertEqual(r1["filename"], r2["filename"])
+        self.assertEqual(len([p for p in self.board.iterdir() if p.name.endswith(f"--{u_same}.md")]), 1)
+
+        # 2. Same UUID, differing bytes, different numbers across two processes -> 1 published + 1 RequestConflictError
+        u_diff = make_uuid(993)
+        p3 = subprocess.Popen(
+            [sys.executable, "-B", "-c", worker, str(HUB_DIR), str(self.board), "12", u_diff, "body-A"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        p4 = subprocess.Popen(
+            [sys.executable, "-B", "-c", worker, str(HUB_DIR), str(self.board), "13", u_diff, "body-B"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        out3, err3 = p3.communicate(timeout=10)
+        out4, err4 = p4.communicate(timeout=10)
+        self.assertEqual(p3.returncode, 0, err3)
+        self.assertEqual(p4.returncode, 0, err4)
+        r3, r4 = json.loads(out3), json.loads(out4)
+        self.assertEqual(sorted([r3["ok"], r4["ok"]]), [False, True])
+        self.assertEqual(len([p for p in self.board.iterdir() if p.name.endswith(f"--{u_diff}.md")]), 1)
+
+    def test_publish_hub_projections_pins_board_and_hub_dir_fds(self):
+        u1 = make_uuid(994)
+        self._write_v2(1, "claude_main", "dsh", "info", u1, u1)
+        snap = board_lint.scan_board(self.board)
+        res = board_state.rebuild(snap, {}, self.as_of)
+
+        # Mismatching expected_root_id fails before creating _hub
+        with self.assertRaises(board_state.PublishError):
+            board_state.publish_hub_projections(
+                self.board, res, healthy=True, health_record=res["health"],
+                expected_root_id=(snap.root_dev, snap.root_ino + 999999),
+            )
+        self.assertFalse((self.board / "_hub").exists())
+
+        # Swapping board_dir mid-publish after dir_fd pin fails before state.json and never writes to swapped dir
+        alt_board = Path(self.tmp.name) / "alt_pub_board"
+        alt_board.mkdir()
+        moved_orig = Path(self.tmp.name) / "moved_pub_orig"
+
+        def swap_mid_publish():
+            self.board.rename(moved_orig)
+            alt_board.rename(self.board)
+
+        with self.assertRaises(board_state.PublishError):
+            board_state.publish_hub_projections(
+                self.board, res, healthy=True, health_record=res["health"],
+                expected_root_id=(snap.root_dev, snap.root_ino),
+                _before_state_hook=swap_mid_publish,
+            )
+        # state.json was NOT written into either directory, and alt_board received zero _hub files
+        self.assertFalse((self.board / "_hub").exists())
+        self.assertFalse((moved_orig / "_hub" / "state.json").exists())
 
 
 if __name__ == "__main__":

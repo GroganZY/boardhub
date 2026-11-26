@@ -1169,8 +1169,20 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
 
 # --- Board scanning (two-pass stable inventory with O_NOFOLLOW) ---
 
+def is_staging_entry(name: str) -> bool:
+    """Return True for hidden, AppleDouble, or staging/in-progress filenames ignored by readers."""
+    if name.startswith("._") or name.startswith("."):
+        return True
+    lower = name.lower()
+    if lower.startswith(("tmp_", "partial_")):
+        return True
+    if lower.endswith((".tmp", ".part", ".partial", ".tmp.md", ".part.md", ".partial.md", "~")):
+        return True
+    return False
+
+
 def _is_ignored_entry(name: str) -> bool:
-    if name.startswith("._") or name.startswith(".") or name == "_hub":
+    if is_staging_entry(name) or name == "_hub":
         return True
     return not MESSAGE_SHAPED_RE.fullmatch(name)
 

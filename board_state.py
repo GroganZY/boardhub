@@ -6,8 +6,11 @@ Python 3.8+ standard library only.
 
 import argparse
 import contextlib
+import ctypes
+import ctypes.util
 from datetime import datetime, timedelta, timezone
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -179,7 +182,7 @@ def build_manifest_from_snapshot(
             "uuid": msg_uuid,
             "thread": thr_uuid,
         }
-    return {
+    out = {
         "version": SCHEMA_VERSION,
         "bootstrapped_at": (
             existing_manifest.get("bootstrapped_at", now_str)
@@ -189,6 +192,9 @@ def build_manifest_from_snapshot(
         "reconciled_at": now_str if reconcile else (existing_manifest.get("reconciled_at") if existing_manifest else None),
         "entries": new_entries,
     }
+    if existing_manifest and isinstance(existing_manifest.get("board_id"), str):
+        out["board_id"] = existing_manifest["board_id"]
+    return out
 
 
 # --- Helpers ---
@@ -1428,24 +1434,54 @@ def render_inbox_markdown(agent: str, result: dict) -> str:
 
 # --- Atomic _hub projection publisher (state.json published LAST) ---
 
-def _ensure_safe_hub_dir(
+@contextlib.contextmanager
+def _open_safe_hub_dir_fd(
     board_dir: Path,
     expected_root_id: Optional[Tuple[int, int]] = None,
-) -> Path:
+):
     board_info = board_dir.lstat()
     if stat.S_ISLNK(board_info.st_mode) or not stat.S_ISDIR(board_info.st_mode):
         raise PublishError("Board directory is not a regular directory.")
     if expected_root_id is not None and (board_info.st_dev, board_info.st_ino) != expected_root_id:
         raise PublishError("Board root directory identity changed before publish.")
-    hub_dir = board_dir / "_hub"
     try:
-        hinfo = hub_dir.lstat()
-    except FileNotFoundError:
-        os.mkdir(hub_dir, 0o700)
-        return hub_dir
-    if stat.S_ISLNK(hinfo.st_mode) or not stat.S_ISDIR(hinfo.st_mode):
-        raise PublishError("_hub path is a symlink or non-directory.")
-    return hub_dir
+        board_fd = os.open(board_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise PublishError(f"Cannot safely open board directory: {exc}") from exc
+    hub_fd = None
+    try:
+        finfo = os.fstat(board_fd)
+        if not stat.S_ISDIR(finfo.st_mode):
+            raise PublishError("Board directory is not a directory.")
+        pinned_id = (finfo.st_dev, finfo.st_ino)
+        if pinned_id != (board_info.st_dev, board_info.st_ino):
+            raise PublishError("Board root directory changed while opening.")
+        if expected_root_id is not None and pinned_id != expected_root_id:
+            raise PublishError("Board root directory identity changed before publish.")
+        try:
+            hub_fd = os.open("_hub", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=board_fd)
+        except FileNotFoundError:
+            os.mkdir("_hub", 0o700, dir_fd=board_fd)
+            hub_fd = os.open("_hub", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=board_fd)
+        except OSError as exc:
+            raise PublishError(f"_hub path is a symlink or unsafe directory: {exc}") from exc
+        hinfo = os.fstat(hub_fd)
+        if not stat.S_ISDIR(hinfo.st_mode):
+            raise PublishError("_hub path is not a directory.")
+        yield board_fd, hub_fd, pinned_id
+    finally:
+        if hub_fd is not None:
+            os.close(hub_fd)
+        os.close(board_fd)
+
+
+def _sync_dir_fd_best_effort(dfd: int) -> None:
+    """Sync directory fd where supported; ignore ENOTSUP/EINVAL/EBADF/EACCES on exFAT."""
+    try:
+        os.fsync(dfd)
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF, errno.EACCES):
+            raise DurabilityError(f"Directory fsync failed: {exc}") from exc
 
 
 def _sync_dir_best_effort(dir_path: Path) -> None:
@@ -1455,21 +1491,15 @@ def _sync_dir_best_effort(dir_path: Path) -> None:
     except OSError as exc:
         raise DurabilityError(f"Failed to open directory for sync: {exc}") from exc
     try:
-        try:
-            os.fsync(dfd)
-        except OSError as exc:
-            if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EBADF, errno.EACCES):
-                raise DurabilityError(f"Directory fsync failed: {exc}") from exc
+        _sync_dir_fd_best_effort(dfd)
     finally:
         os.close(dfd)
 
 
-def _atomic_write_hub_file(hub_dir: Path, name: str, content: bytes) -> None:
+def _atomic_write_hub_file_fd(hub_fd: int, name: str, content: bytes) -> None:
     tmp_name = f".tmp_{name}_{os.getpid()}_{secrets.token_hex(6)}"
-    tmp_path = hub_dir / tmp_name
-    final_path = hub_dir / name
     try:
-        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=hub_fd)
     except OSError as exc:
         raise DurabilityError(f"Cannot create temp projection file {name}: {exc}") from exc
     try:
@@ -1480,10 +1510,10 @@ def _atomic_write_hub_file(hub_dir: Path, name: str, content: bytes) -> None:
                 os.fsync(handle.fileno())
             except OSError as exc:
                 raise DurabilityError(f"Projection fsync failed for {name}: {exc}") from exc
-        os.replace(tmp_path, final_path)
+        os.replace(tmp_name, name, src_dir_fd=hub_fd, dst_dir_fd=hub_fd)
     except BaseException:
         with contextlib.suppress(OSError):
-            tmp_path.unlink()
+            os.unlink(tmp_name, dir_fd=hub_fd)
         raise
 
 
@@ -1493,40 +1523,125 @@ def publish_hub_projections(
     healthy: bool = True,
     health_record: Optional[dict] = None,
     expected_root_id: Optional[Tuple[int, int]] = None,
+    _before_state_hook=None,
 ) -> None:
-    """Publish _hub projections atomically with state.json written LAST; preserve good state if unhealthy."""
+    """Publish _hub projections atomically via pinned dir_fds with state.json written LAST."""
     board_path = Path(board_dir)
-    hub_dir = _ensure_safe_hub_dir(board_path, expected_root_id=expected_root_id)
+    with _open_safe_hub_dir_fd(board_path, expected_root_id=expected_root_id) as (_board_fd, hub_fd, pinned_id):
+        if not healthy:
+            if health_record is not None:
+                hbytes = (json.dumps(health_record, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+                _atomic_write_hub_file_fd(hub_fd, "HEALTH.json", hbytes)
+                _sync_dir_fd_best_effort(hub_fd)
+            return
 
-    if not healthy:
+        # Write non-state views first
+        lint_bytes = (json.dumps(result["lint"], indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+        _atomic_write_hub_file_fd(hub_fd, "lint.json", lint_bytes)
+
+        status_bytes = render_status_markdown(result).encode("utf-8")
+        _atomic_write_hub_file_fd(hub_fd, "STATUS.md", status_bytes)
+
+        for agent in get_inbox_recipients():
+            inbox_bytes = render_inbox_markdown(agent, result).encode("utf-8")
+            _atomic_write_hub_file_fd(hub_fd, f"inbox_{agent}.md", inbox_bytes)
+
         if health_record is not None:
             hbytes = (json.dumps(health_record, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
-            _atomic_write_hub_file(hub_dir, "HEALTH.json", hbytes)
-            _sync_dir_best_effort(hub_dir)
-        return
+            _atomic_write_hub_file_fd(hub_fd, "HEALTH.json", hbytes)
 
-    # Write non-state views first
-    lint_bytes = (json.dumps(result["lint"], indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_write_hub_file(hub_dir, "lint.json", lint_bytes)
+        if _before_state_hook is not None:
+            _before_state_hook()
+        if expected_root_id is not None:
+            cur_info = board_path.lstat()
+            if (
+                stat.S_ISLNK(cur_info.st_mode)
+                or not stat.S_ISDIR(cur_info.st_mode)
+                or (cur_info.st_dev, cur_info.st_ino) != pinned_id
+            ):
+                raise PublishError("Board root directory identity changed during publish.")
 
-    status_bytes = render_status_markdown(result).encode("utf-8")
-    _atomic_write_hub_file(hub_dir, "STATUS.md", status_bytes)
-
-    for agent in get_inbox_recipients():
-        inbox_bytes = render_inbox_markdown(agent, result).encode("utf-8")
-        _atomic_write_hub_file(hub_dir, f"inbox_{agent}.md", inbox_bytes)
-
-    if health_record is not None:
-        hbytes = (json.dumps(health_record, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
-        _atomic_write_hub_file(hub_dir, "HEALTH.json", hbytes)
-
-    # Publish state.json LAST so readers observing updated state.json see matching snapshot IDs everywhere
-    state_bytes = (json.dumps(result["state"], indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_write_hub_file(hub_dir, "state.json", state_bytes)
-    _sync_dir_best_effort(hub_dir)
+        # Publish state.json LAST so readers observing updated state.json see matching snapshot IDs everywhere
+        state_bytes = (json.dumps(result["state"], indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+        _atomic_write_hub_file_fd(hub_fd, "state.json", state_bytes)
+        _sync_dir_fd_best_effort(hub_fd)
 
 
 # --- Safe concurrent v2 message publisher ---
+
+_DARWIN_RENAME_EXCL = 0x00000004
+
+
+def _load_renameatx_np():
+    if sys.platform != "darwin":
+        return None
+    lib_name = ctypes.util.find_library("c")
+    if not lib_name:
+        return None
+    libc = ctypes.CDLL(lib_name, use_errno=True)
+    fn = getattr(libc, "renameatx_np", None)
+    if fn is None:
+        return None
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+_RENAMEATX_NP = _load_renameatx_np()
+
+
+def _rename_noreplace(src_path: Path, dst_path: Path) -> None:
+    """Atomically rename src_path to dst_path without replacing target where supported."""
+    if _RENAMEATX_NP is None or src_path.parent != dst_path.parent:
+        raise OSError(errno.ENOTSUP, "No-replace rename is not supported on this platform.")
+    dfd = os.open(src_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        ctypes.set_errno(0)
+        rc = _RENAMEATX_NP(
+            dfd,
+            os.fsencode(src_path.name),
+            dfd,
+            os.fsencode(dst_path.name),
+            _DARWIN_RENAME_EXCL,
+        )
+        if rc != 0:
+            err = ctypes.get_errno() or errno.EIO
+            if err == errno.EEXIST:
+                raise FileExistsError(err, os.strerror(err), str(dst_path))
+            raise OSError(err, os.strerror(err), str(dst_path))
+    finally:
+        os.close(dfd)
+
+
+@contextlib.contextmanager
+def _board_publish_lock(board_path: Path):
+    """Advisory board-level lock serializing cross-process UUID publication and exFAT fallback."""
+    lock_path = board_path / ".boardhub_publish.lock"
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        if exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM):
+            yield
+            return
+        raise DurabilityError(f"Failed opening publish lock: {exc}") from exc
+    locked = False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PublishError("Publish lock path is not a regular file.")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+        except OSError as exc:
+            if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
+                raise DurabilityError(f"Failed acquiring publish lock: {exc}") from exc
+        yield
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
 
 def _get_publish_lock(board_dir: Path, message_uuid: str) -> threading.Lock:
     key = (str(board_dir.resolve()), message_uuid)
@@ -1543,6 +1658,13 @@ def _link_supports_hardlinks(dir_path: Path) -> bool:
         return os.path.supports_follow_symlinks and os.pathconf(str(dir_path), "PC_LINK_MAX") > 1
     except OSError:
         return True
+
+
+def _find_existing_uuid_files(board_path: Path, message_uuid: str) -> List[str]:
+    return sorted(
+        name for name in os.listdir(board_path)
+        if not board_lint.is_staging_entry(name) and name.endswith(f"--{message_uuid}.md")
+    )
 
 
 def publish_message(
@@ -1590,99 +1712,101 @@ def publish_message(
         if stat.S_ISLNK(binfo.st_mode) or not stat.S_ISDIR(binfo.st_mode):
             raise PublishError("Board directory is unsafe or missing.")
 
-        # Check existing files carrying this UUID before creating temp file
-        existing = sorted(
-            name for name in os.listdir(board_path)
-            if not name.startswith(".") and name.endswith(f"--{message_uuid}.md")
-        )
-        if existing:
-            return _verify_existing_publication(board_path, existing, raw, from_agent, to_agent, message_uuid)
+        with _board_publish_lock(board_path):
+            # Check existing files carrying this UUID before creating temp file
+            existing = _find_existing_uuid_files(board_path, message_uuid)
+            if existing:
+                return _verify_existing_publication(board_path, existing, raw, from_agent, to_agent, message_uuid)
 
-        tmp_name = f".tmp_{message_uuid}_{os.getpid()}_{secrets.token_hex(6)}.md"
-        tmp_path = board_path / tmp_name
-        final_path = board_path / final_name
-
-        try:
-            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        except OSError as exc:
-            raise DurabilityError(f"Failed creating temp message file: {exc}") from exc
-
-        created_final_exclusively = False
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(raw)
-                handle.flush()
-                try:
-                    _fsync_file_fn(handle.fileno())
-                except OSError as exc:
-                    raise DurabilityError(f"File fsync failed: {exc}") from exc
-
-            # Re-check existing UUID files before publishing final name so we never replace or renumber
-            existing_now = sorted(
-                name for name in os.listdir(board_path)
-                if not name.startswith(".") and name.endswith(f"--{message_uuid}.md")
-            )
-            if existing_now or final_path.exists() or final_path.is_symlink():
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink()
-                targets = existing_now or [final_name]
-                return _verify_existing_publication(board_path, targets, raw, from_agent, to_agent, message_uuid)
-
-            if _before_publish_hook is not None:
-                _before_publish_hook()
+            tmp_name = f".tmp_{message_uuid}_{os.getpid()}_{secrets.token_hex(6)}.md"
+            tmp_path = board_path / tmp_name
+            final_path = board_path / final_name
 
             try:
-                os.link(tmp_path, final_path)
-            except FileExistsError:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink()
-                return _verify_existing_publication(board_path, [final_name], raw, from_agent, to_agent, message_uuid)
+                fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             except OSError as exc:
-                unsupported_link = (
-                    exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EMLINK)
-                    or (exc.errno == errno.EPERM and not _link_supports_hardlinks(board_path))
-                )
-                if not unsupported_link:
-                    raise
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink()
-                try:
-                    final_fd = os.open(final_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                except FileExistsError:
-                    return _verify_existing_publication(board_path, [final_name], raw, from_agent, to_agent, message_uuid)
-                except OSError as open_exc:
-                    raise DurabilityError(f"Failed creating exclusive message file: {open_exc}") from open_exc
-                created_final_exclusively = True
-                with os.fdopen(final_fd, "wb") as handle:
+                raise DurabilityError(f"Failed creating temp message file: {exc}") from exc
+
+            try:
+                with os.fdopen(fd, "wb") as handle:
                     handle.write(raw)
                     handle.flush()
                     try:
                         _fsync_file_fn(handle.fileno())
-                    except OSError as fsync_exc:
-                        raise DurabilityError(f"File fsync failed: {fsync_exc}") from fsync_exc
-            else:
+                    except OSError as exc:
+                        raise DurabilityError(f"File fsync failed: {exc}") from exc
+
+                # Re-check existing UUID files before publishing final name so we never replace or renumber
+                existing_now = _find_existing_uuid_files(board_path, message_uuid)
+                if existing_now or final_path.exists() or final_path.is_symlink():
+                    with contextlib.suppress(OSError):
+                        tmp_path.unlink()
+                    targets = existing_now or [final_name]
+                    return _verify_existing_publication(board_path, targets, raw, from_agent, to_agent, message_uuid)
+
+                if _before_publish_hook is not None:
+                    _before_publish_hook()
+
+                try:
+                    os.link(tmp_path, final_path)
+                except FileExistsError:
+                    with contextlib.suppress(OSError):
+                        tmp_path.unlink()
+                    return _verify_existing_publication(board_path, [final_name], raw, from_agent, to_agent, message_uuid)
+                except OSError as exc:
+                    unsupported_link = (
+                        exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EMLINK)
+                        or (exc.errno == errno.EPERM and not _link_supports_hardlinks(board_path))
+                    )
+                    if not unsupported_link:
+                        raise
+                    try:
+                        _rename_noreplace(tmp_path, final_path)
+                    except FileExistsError:
+                        with contextlib.suppress(OSError):
+                            tmp_path.unlink()
+                        return _verify_existing_publication(board_path, [final_name], raw, from_agent, to_agent, message_uuid)
+                    except OSError as ren_exc:
+                        if ren_exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL):
+                            raise DurabilityError(f"Atomic no-replace rename failed: {ren_exc}") from ren_exc
+                        # Filesystem (e.g. macOS exFAT) supports neither hardlinks nor RENAME_EXCL;
+                        # verify non-existence under board publish lock and replace atomically from synced tmp_path.
+                        existing_after = _find_existing_uuid_files(board_path, message_uuid)
+                        final_exists = False
+                        try:
+                            os.lstat(final_path)
+                            final_exists = True
+                        except FileNotFoundError:
+                            final_exists = False
+                        if existing_after or final_exists:
+                            with contextlib.suppress(OSError):
+                                tmp_path.unlink()
+                            targets = existing_after or [final_name]
+                            return _verify_existing_publication(board_path, targets, raw, from_agent, to_agent, message_uuid)
+                        try:
+                            os.replace(tmp_path, final_path)
+                        except OSError as rep_exc:
+                            raise DurabilityError(f"Failed publishing synced temp message file: {rep_exc}") from rep_exc
+                else:
+                    with contextlib.suppress(OSError):
+                        tmp_path.unlink()
+            except BaseException:
                 with contextlib.suppress(OSError):
                     tmp_path.unlink()
-        except BaseException:
-            with contextlib.suppress(OSError):
-                tmp_path.unlink()
-            if created_final_exclusively:
-                with contextlib.suppress(OSError):
-                    final_path.unlink()
-            raise
+                raise
 
-        if sync_dir:
-            if _fsync_dir_fn is not None:
-                _fsync_dir_fn(board_path)
-            else:
-                _sync_dir_best_effort(board_path)
+            if sync_dir:
+                if _fsync_dir_fn is not None:
+                    _fsync_dir_fn(board_path)
+                else:
+                    _sync_dir_best_effort(board_path)
 
-        return {
-            "status": "published",
-            "filename": final_name,
-            "uuid": message_uuid,
-            "sha256": dummy_entry.sha256,
-        }
+            return {
+                "status": "published",
+                "filename": final_name,
+                "uuid": message_uuid,
+                "sha256": dummy_entry.sha256,
+            }
 
 
 def _verify_existing_publication(
@@ -1823,6 +1947,7 @@ def main(argv=None) -> int:
             result,
             healthy=result["health"]["healthy"],
             health_record=result["health"],
+            expected_root_id=(snapshot.root_dev, snapshot.root_ino) if snapshot.healthy else None,
         )
 
     if args.json:

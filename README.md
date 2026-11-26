@@ -11,7 +11,7 @@ BoardHub avoids database daemons and network servers by layering four determinis
 1. **File Board (`<board>/`, e.g. `~/boardhub/board`):**
    - Each v2 message is a self-contained UTF-8 Markdown file named `NNNN_<from>_to_<to>--<uuid>.md` with strict LF YAML-subset frontmatter (`request_id`, `thread`, `prev`, `sent_at`, `needs_user`, optional JSON `delivers` / `review_of` / 21-item `checklist`).
    - Legacy `NNNN_<from>_to_<to>.md` files are preserved read-only for history without entering the v2 state machine.
-   - `board_state.publish_message(...)` writes via unique temp file -> `flush()` + `fsync()` -> exclusive `os.link()` (falling back to `O_CREAT | O_EXCL` on filesystems without hard links) -> directory `fsync`, with idempotent same-UUID retry and `REQUEST_CONFLICT` protection.
+   - `board_state.publish_message(...)` writes via unique temp file -> `flush()` + `fsync()` -> exclusive `os.link()` (falling back to `renameatx_np(RENAME_EXCL)` where supported, or locked pre-checked `os.replace()` from the synced temp file on exFAT) -> directory `fsync`, with idempotent same-UUID retry and `REQUEST_CONFLICT` protection; readers ignore `.tmp_*` and staging files still being written.
 
 2. **Single Parser & Linter (`board_lint.py`):**
    - Shared by CLI, state rebuild, watcher, and HTML view so every component evaluates identical rules.

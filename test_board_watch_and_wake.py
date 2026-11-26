@@ -450,6 +450,123 @@ class AvailabilityRecoveryWatcherTests(unittest.TestCase):
         self.assertEqual(rc_skip, 0)
         apfs_skip.assert_not_called()
 
+    def test_cross_tick_stable_directory_swap_detected_via_board_id(self):
+        u1 = make_uuid(730)
+        fn1 = self._write_msg(1, "claude_main", "gemini", "info", u1, u1, body="original board msg")
+        board_watch.bootstrap_runtime(self.board, self.runtime, as_of=self.clock())
+        manifest_before = json.loads((self.runtime / "manifest.json").read_text(encoding="utf-8"))
+        board_id = manifest_before.get("board_id")
+        self.assertTrue(board_id)
+        self.assertEqual((self.board / ".boardhub_id").read_text(encoding="utf-8").strip(), board_id)
+
+        # Swap board between ticks with an identical-content stable alternate directory (no matching .boardhub_id)
+        alt_board = self.root / "alt_stable_board"
+        alt_board.mkdir(mode=0o700)
+        (alt_board / fn1).write_bytes((self.board / fn1).read_bytes())
+        u2 = make_uuid(731)
+        fn2 = f"0002_claude_main_to_gemini--{u2}.md"
+        (alt_board / fn2).write_bytes(build_v2_md("claude_main", "gemini", "info", u2, u2, body="injected"))
+        orig_saved = self.root / "orig_saved"
+
+        self.clock.advance(20)
+        self.board.rename(orig_saved)
+        alt_board.rename(self.board)
+        res_swap = board_watch.run_tick(self.board, self.runtime, now_fn=self.clock)
+        self.assertEqual(res_swap["exit_code"], 2)
+        self.assertFalse(res_swap["healthy"])
+        self.assertEqual(res_swap["reason"], "board_identity_changed")
+        # Manifest was NOT polluted with alt_board's entry and alt_board got NO _hub dir
+        manifest_after = json.loads((self.runtime / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest_after, manifest_before)
+        self.assertFalse((self.board / "_hub").exists())
+
+        # Simulate normal exFAT remount (different directory inode, same .boardhub_id and files) -> succeeds
+        remounted_board = self.root / "remounted_board"
+        remounted_board.mkdir(mode=0o700)
+        (remounted_board / ".boardhub_id").write_bytes((orig_saved / ".boardhub_id").read_bytes())
+        (remounted_board / fn1).write_bytes((orig_saved / fn1).read_bytes())
+        self.board.rename(alt_board)
+        remounted_board.rename(self.board)
+        self.clock.advance(20)
+        res_remount = board_watch.run_tick(self.board, self.runtime, now_fn=self.clock)
+        self.assertEqual(res_remount["exit_code"], 0)
+        self.assertTrue(res_remount["healthy"])
+
+        # Dispatch-boundary pin catches directory swap after final rebuild right before wake()
+        self._enable_gemini_route()
+        self.clock.advance(20)
+        board_watch.run_tick(self.board, self.runtime, now_fn=self.clock)
+        self.clock.advance(20)
+        u3 = make_uuid(732)
+        self._write_msg(3, "claude_main", "gemini", "info", u3, u3, body="dispatch pin test")
+        wake_calls = []
+        orig_check_rate = wake_routes.WakeLedger.check_rate_limit
+
+        def swap_at_dispatch_boundary(wl_self, ag, now_dt):
+            res = orig_check_rate(wl_self, ag, now_dt)
+            if self.board.exists():
+                self.board.rename(self.root / "orig_dispatch_moved")
+                alt_board.rename(self.board)
+            return res
+
+        with mock.patch.object(wake_routes.WakeLedger, "check_rate_limit", autospec=True, side_effect=swap_at_dispatch_boundary):
+            res_disp = board_watch.run_tick(
+                self.board, self.runtime, now_fn=self.clock,
+                agy_runner=lambda **kw: (wake_calls.append(kw) or "accepted", "accepted"),
+            )
+        self.assertEqual(res_disp["exit_code"], 2)
+        self.assertEqual(res_disp["reason"], "board_identity_changed")
+        self.assertIsNone(res_disp["wake_sent"])
+        self.assertEqual(wake_calls, [])
+
+    def test_bootstrap_crash_safe_order_and_mail_ledger_no_wake_marker(self):
+        # 1. MailLedger.save() must NOT create .wake_ledger.initialized
+        rt_mail = self.root / "rt_mail"
+        rt_mail.mkdir(mode=0o700)
+        ml, _ = wake_routes.MailLedger.load(rt_mail / "mail_ledger.json", now=self.clock())
+        ml.save()
+        self.assertFalse((rt_mail / wake_routes.WAKE_LEDGER_INIT_MARKER).exists())
+        self.assertFalse(wake_routes.is_wake_ledger_initialized(rt_mail))
+
+        # 2. Corrupt routes.json during bootstrap fails BEFORE writing manifest/baseline/wake_ledger
+        rt_bad = self.root / "rt_bad_route"
+        rt_bad.mkdir(mode=0o700)
+        (rt_bad / "routes.json").write_text("{corrupt", encoding="utf-8")
+        os.chmod(rt_bad / "routes.json", 0o600)
+        with self.assertRaises(board_watch.WatcherError):
+            board_watch.bootstrap_runtime(self.board, rt_bad, as_of=self.clock())
+        for name in ("manifest.json", "baseline.json", "wake_ledger.json", "mail_ledger.json", ".wake_ledger.initialized"):
+            self.assertFalse((rt_bad / name).exists())
+        # Fixing routes.json allows bootstrap to succeed cleanly
+        (rt_bad / "routes.json").write_text(json.dumps({"version": 2, "routes": {}}), encoding="utf-8")
+        board_watch.bootstrap_runtime(self.board, rt_bad, as_of=self.clock())
+        self.assertTrue((rt_bad / "manifest.json").exists())
+        self.assertTrue((rt_bad / "wake_ledger.json").exists())
+
+        # 3. Crash after wake_ledger.save() (before manifest/baseline) recovers cleanly on re-bootstrap
+        rt_crash = self.root / "rt_crash"
+        rt_crash.mkdir(mode=0o700)
+
+        def boom():
+            raise RuntimeError("simulated crash after wake_ledger save")
+
+        with self.assertRaises(RuntimeError):
+            board_watch.bootstrap_runtime(self.board, rt_crash, as_of=self.clock(), _after_wake_save_hook=boom)
+        self.assertTrue((rt_crash / "wake_ledger.json").exists())
+        self.assertFalse((rt_crash / "manifest.json").exists())
+        self.assertFalse((rt_crash / "baseline.json").exists())
+        board_watch.bootstrap_runtime(self.board, rt_crash, as_of=self.clock())
+        self.assertTrue((rt_crash / "manifest.json").exists())
+        self.assertTrue((rt_crash / "baseline.json").exists())
+
+        # 4. Missing wake_ledger.json on already-initialized runtime refuses WITHOUT modifying manifest/baseline
+        before_manifest = (rt_crash / "manifest.json").read_bytes()
+        (rt_crash / "wake_ledger.json").unlink()
+        with self.assertRaises(board_watch.WatcherError):
+            board_watch.bootstrap_runtime(self.board, rt_crash, as_of=self.clock())
+        self.assertEqual((rt_crash / "manifest.json").read_bytes(), before_manifest)
+        self.assertFalse((rt_crash / "wake_ledger.json").exists())
+
 
 class WakeAndMailTests(unittest.TestCase):
     def setUp(self):
@@ -696,6 +813,93 @@ class WakeAndMailTests(unittest.TestCase):
         elapsed = time.monotonic() - t0
         self.assertEqual((outcome, rcode), ("uncertain", "output_limit_exceeded"))
         self.assertLess(elapsed, 2.5)
+
+    def test_legacy_retryable_record_migrated_to_uncertain_once_while_new_retries_work(self):
+        u_leg_retry = make_uuid(820)
+        u_leg_ok = make_uuid(821)
+        past_attempt = board_lint.format_utc_rfc3339(self.clock() - timedelta(minutes=10))
+        past_retry = board_lint.format_utc_rfc3339(self.clock() - timedelta(minutes=9))
+        legacy_ledger = {
+            "version": 2,
+            "route_baselines": {},
+            "records": {
+                f"gemini:{u_leg_retry}": {
+                    "agent": "gemini",
+                    "message_uuid": u_leg_retry,
+                    "status": "not_sent",
+                    "attempt_count": 1,
+                    "attempts": [
+                        {
+                            "at": past_attempt,
+                            "outcome": "not_sent",
+                            "reason_code": "broker_unavailable",
+                            "duration_ms": 12,
+                            "finished_at": past_attempt,
+                        }
+                    ],
+                    "transient_retryable": True,
+                    "retry_after": past_retry,
+                    "operator_action_required": False,
+                    "last_reason_code": "broker_unavailable",
+                    "last_attempt_at": past_attempt,
+                },
+                f"gemini:{u_leg_ok}": {
+                    "agent": "gemini",
+                    "message_uuid": u_leg_ok,
+                    "status": "accepted",
+                    "attempt_count": 1,
+                    "attempts": [
+                        {
+                            "at": past_attempt,
+                            "outcome": "accepted",
+                            "reason_code": "accepted",
+                            "duration_ms": 5,
+                            "finished_at": past_attempt,
+                        }
+                    ],
+                    "transient_retryable": False,
+                    "retry_after": None,
+                    "operator_action_required": False,
+                    "last_reason_code": "accepted",
+                    "last_attempt_at": past_attempt,
+                },
+            },
+        }
+        ledger_path = self.runtime / "wake_ledger.json"
+        ledger_path.write_bytes(json.dumps(legacy_ledger).encode("utf-8"))
+        os.chmod(ledger_path, 0o600)
+
+        wl, corrupt = wake_routes.WakeLedger.load(ledger_path, now=self.clock(), allow_missing=False)
+        self.assertFalse(corrupt)
+        self.assertEqual(wl.state["retry_semantics_version"], 2)
+
+        mig_rec = wl.get_record("gemini", u_leg_retry)
+        self.assertEqual(mig_rec["status"], "uncertain")
+        self.assertFalse(mig_rec["transient_retryable"])
+        self.assertIsNone(mig_rec["retry_after"])
+        self.assertTrue(mig_rec["operator_action_required"])
+        self.assertEqual(mig_rec["last_reason_code"], "legacy_retry_uncertain")
+        self.assertEqual(mig_rec["attempts"][0]["reason_code"], "broker_unavailable")
+        self.assertFalse(wl.is_eligible("gemini", u_leg_retry, self.clock()))
+        self.assertEqual(
+            [i for i in wl.attention_items() if i["message_id"] == u_leg_retry][0]["reason_code"],
+            "wake_uncertain",
+        )
+        self.assertEqual(wl.get_record("gemini", u_leg_ok)["status"], "accepted")
+
+        # Post-upgrade broker_unavailable remains legitimately retryable across reloads
+        u_new = make_uuid(822)
+        c_unavail = self._write_fake_agy_client(
+            'import sys, json; print(json.dumps({"ok": False, "error": {"code": "broker_unavailable", "message": "down"}})); sys.exit(1)\n'
+        )
+        self.assertEqual(
+            wake_routes.wake("gemini", u_new, runtime_dir=self.runtime, config=self._cfg(c_unavail), now_fn=self.clock),
+            "not_sent",
+        )
+        self.clock.advance(65)
+        wl_reloaded, _ = wake_routes.WakeLedger.load(ledger_path, now=self.clock(), allow_missing=False)
+        self.assertTrue(wl_reloaded.is_eligible("gemini", u_new, self.clock()))
+        self.assertEqual(wl_reloaded.get_record("gemini", u_leg_retry)["status"], "uncertain")
 
 
 if __name__ == "__main__":

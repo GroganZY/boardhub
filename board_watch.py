@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import secrets
 import signal
 import stat
 import subprocess
@@ -20,6 +21,7 @@ import sys
 import syslog
 import time
 from typing import Callable, Optional, Set, Tuple
+import uuid
 
 if "board_lint" in sys.modules:
     board_lint = sys.modules["board_lint"]
@@ -57,6 +59,7 @@ HEALTH_NAME = "health.json"
 LAST_PUBLISHED_NAME = "last_published.json"
 LOCK_NAME = "watch.lock"
 LOG_NAME = "watch.log"
+BOARD_ID_NAME = ".boardhub_id"
 
 LOG = logging.getLogger("boardhub_watch")
 
@@ -231,10 +234,79 @@ def _update_manifest_with_new_entries(
     return updated, True
 
 
+def _read_board_id_fd(dir_fd: int) -> Tuple[Optional[str], bool]:
+    """Read canonical UUIDv4 from .boardhub_id inside dir_fd. Returns (uuid_or_none, unsafe_or_corrupt)."""
+    try:
+        fd = os.open(BOARD_ID_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None, False
+    except OSError:
+        return None, True
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 128:
+            return None, True
+        raw = os.read(fd, 129)
+    except OSError:
+        return None, True
+    finally:
+        os.close(fd)
+    if len(raw) > 128:
+        return None, True
+    try:
+        val = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None, True
+    if not board_lint.UUID_V4_RE.fullmatch(val):
+        return None, True
+    return val, False
+
+
+def _ensure_board_id(board_dir: Path, expected_root_id: Optional[Tuple[int, int]] = None) -> str:
+    """Read or atomically establish .boardhub_id inside pinned board_dir."""
+    board_path = Path(board_dir)
+    try:
+        dfd = os.open(board_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise WatcherError(f"Cannot safely open board directory for identity check: {exc}") from exc
+    try:
+        finfo = os.fstat(dfd)
+        if not stat.S_ISDIR(finfo.st_mode):
+            raise WatcherError("Board directory is not a directory.")
+        if expected_root_id is not None and (finfo.st_dev, finfo.st_ino) != expected_root_id:
+            raise WatcherError("Board root directory identity changed while establishing board_id.")
+        existing, unsafe = _read_board_id_fd(dfd)
+        if unsafe:
+            raise WatcherError("Board identity marker .boardhub_id is unsafe or corrupt.")
+        if existing is not None:
+            return existing
+        new_id = str(uuid.uuid4())
+        tmp_name = f".tmp_{BOARD_ID_NAME}_{os.getpid()}_{secrets.token_hex(6)}"
+        tfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        try:
+            with os.fdopen(tfd, "wb") as handle:
+                handle.write((new_id + "\n").encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            existing_now, unsafe_now = _read_board_id_fd(dfd)
+            if unsafe_now:
+                raise WatcherError("Board identity marker .boardhub_id is unsafe or corrupt.")
+            if existing_now is not None:
+                return existing_now
+            os.replace(tmp_name, BOARD_ID_NAME, src_dir_fd=dfd, dst_dir_fd=dfd)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name, dir_fd=dfd)
+        return new_id
+    finally:
+        os.close(dfd)
+
+
 def _verify_board_root_pinned(
     board_dir: Path,
     expected_dev: Optional[int],
     expected_ino: Optional[int],
+    expected_board_id: Optional[str] = None,
 ) -> bool:
     if expected_dev is None or expected_ino is None:
         return False
@@ -246,6 +318,10 @@ def _verify_board_root_pinned(
         dir_fd = os.open(board_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             finfo = os.fstat(dir_fd)
+            if expected_board_id is not None:
+                bid, unsafe = _read_board_id_fd(dir_fd)
+                if unsafe or bid != expected_board_id:
+                    return False
         finally:
             os.close(dir_fd)
     except OSError:
@@ -261,6 +337,7 @@ def bootstrap_runtime(
     board_dir: Path,
     runtime_dir: Path,
     as_of: Optional[datetime] = None,
+    _after_wake_save_hook: Optional[Callable[[], None]] = None,
 ) -> dict:
     """Explicitly bootstrap APFS manifest, baseline (inbox-only), route baselines, and _hub views."""
     ensure_non_root()
@@ -268,6 +345,7 @@ def bootstrap_runtime(
     already_init = wake_routes.is_wake_ledger_initialized(runtime_dir)
     now = as_of or datetime.now(timezone.utc)
 
+    # 1. Scan board and validate all existing runtime configs/ledgers BEFORE writing anything
     snapshot = board_lint.scan_board(board_dir)
     if not snapshot.healthy:
         health_rec = {
@@ -279,9 +357,6 @@ def bootstrap_runtime(
         _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
         raise WatcherError(f"Bootstrap failed: unstable or unavailable board scan ({snapshot.scan_error}).")
 
-    manifest = board_state.build_manifest_from_snapshot(snapshot, now)
-    board_state.save_manifest(runtime_dir / MANIFEST_NAME, manifest)
-
     route_cfg, route_corrupt = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
     if route_corrupt:
         raise WatcherError("Route config is corrupt during bootstrap.")
@@ -290,11 +365,6 @@ def bootstrap_runtime(
     if hk_corrupt:
         raise WatcherError("Housekeeping receipts file is corrupt during bootstrap.")
 
-    # Preliminary rebuild to identify all valid accepted UUIDs at baseline
-    pre_result = board_state.rebuild(snapshot, manifest, now, housekeeping_ids=hk_ids)
-    baseline_uuids = _extract_accepted_uuids(pre_result)
-    _save_baseline(runtime_dir / BASELINE_NAME, baseline_uuids, now)
-
     wake_ledger, wake_corrupt = wake_routes.WakeLedger.load(
         runtime_dir / WAKE_LEDGER_NAME,
         now=now,
@@ -302,14 +372,19 @@ def bootstrap_runtime(
     )
     if wake_corrupt:
         raise WatcherError("Wake ledger is corrupt or missing during bootstrap.")
-    wake_ledger.sync_route_baselines(route_cfg, baseline_uuids, now)
-    wake_ledger.save()
 
     mail_ledger, mail_corrupt = wake_routes.MailLedger.load(runtime_dir / MAIL_LEDGER_NAME, now=now)
     if mail_corrupt:
         raise WatcherError("Mail ledger is corrupt during bootstrap.")
-    mail_ledger.save()
 
+    pinned_root_id = (snapshot.root_dev, snapshot.root_ino)
+    board_id = _ensure_board_id(board_dir, expected_root_id=pinned_root_id)
+    manifest = board_state.build_manifest_from_snapshot(snapshot, now)
+    manifest["board_id"] = board_id
+
+    # Preliminary rebuild to identify all valid accepted UUIDs at baseline
+    pre_result = board_state.rebuild(snapshot, manifest, now, housekeeping_ids=hk_ids)
+    baseline_uuids = _extract_accepted_uuids(pre_result)
     result = board_state.rebuild(
         snapshot,
         manifest,
@@ -322,7 +397,22 @@ def bootstrap_runtime(
     health_rec["snapshot_id"] = result["snapshot_id"]
     health_rec["bootstrapped"] = True
 
-    board_state.publish_hub_projections(board_dir, result, healthy=True, health_record=health_rec)
+    # 2. Write ledgers BEFORE baseline & manifest so crash recovery never strands manifest without wake_ledger
+    mail_ledger.save()
+    wake_ledger.sync_route_baselines(route_cfg, baseline_uuids, now)
+    wake_ledger.save()
+    if _after_wake_save_hook is not None:
+        _after_wake_save_hook()
+    _save_baseline(runtime_dir / BASELINE_NAME, baseline_uuids, now)
+    board_state.save_manifest(runtime_dir / MANIFEST_NAME, manifest)
+
+    board_state.publish_hub_projections(
+        board_dir,
+        result,
+        healthy=True,
+        health_record=health_rec,
+        expected_root_id=pinned_root_id,
+    )
     _write_apfs_json(runtime_dir / MAIL_PENDING_NAME, result["mail_pending"])
     _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
     _write_apfs_json(runtime_dir / LAST_PUBLISHED_NAME, {"snapshot_id": result["snapshot_id"], "as_of": result["as_of"]})
@@ -343,9 +433,6 @@ def reconcile_runtime_manifest(
     if not snapshot.healthy:
         raise WatcherError(f"Reconciliation failed: board scan unhealthy ({snapshot.scan_error}).")
 
-    manifest = board_state.build_manifest_from_snapshot(snapshot, now, reconcile=True)
-    board_state.save_manifest(runtime_dir / MANIFEST_NAME, manifest)
-
     hk_ids, _hk_obj, hk_corrupt = board_state.load_housekeeping_receipts(runtime_dir / HOUSEKEEPING_NAME)
     if hk_corrupt:
         raise WatcherError("Housekeeping receipts corrupt.")
@@ -353,6 +440,12 @@ def reconcile_runtime_manifest(
     baseline_uuids, b_corrupt = _load_baseline(runtime_dir / BASELINE_NAME)
     if b_corrupt or baseline_uuids is None:
         baseline_uuids = set()
+
+    pinned_root_id = (snapshot.root_dev, snapshot.root_ino)
+    board_id = _ensure_board_id(board_dir, expected_root_id=pinned_root_id)
+    manifest = board_state.build_manifest_from_snapshot(snapshot, now, reconcile=True)
+    manifest["board_id"] = board_id
+    board_state.save_manifest(runtime_dir / MANIFEST_NAME, manifest)
 
     result = board_state.rebuild(
         snapshot,
@@ -366,7 +459,13 @@ def reconcile_runtime_manifest(
     health_rec["snapshot_id"] = result["snapshot_id"]
     health_rec["reconciled_at"] = result["as_of"]
 
-    board_state.publish_hub_projections(board_dir, result, healthy=True, health_record=health_rec)
+    board_state.publish_hub_projections(
+        board_dir,
+        result,
+        healthy=True,
+        health_record=health_rec,
+        expected_root_id=pinned_root_id,
+    )
     _write_apfs_json(runtime_dir / MAIL_PENDING_NAME, result["mail_pending"])
     _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
     _write_apfs_json(runtime_dir / LAST_PUBLISHED_NAME, {"snapshot_id": result["snapshot_id"], "as_of": result["as_of"]})
@@ -430,8 +529,16 @@ def run_tick(
         _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
         return {"exit_code": 2, "healthy": False, "reason": "not_bootstrapped", "wake_sent": None}
 
-    # 2. Scan board safely
+    # 2. Scan board safely & verify cross-tick board identity before touching manifest or projections
     snapshot = board_lint.scan_board(board_dir)
+    manifest_board_id = manifest.get("board_id") if isinstance(manifest, dict) else None
+    board_identity_mismatch = (
+        snapshot.healthy
+        and isinstance(manifest_board_id, str)
+        and not _verify_board_root_pinned(
+            board_dir, snapshot.root_dev, snapshot.root_ino, expected_board_id=manifest_board_id
+        )
+    )
     result = board_state.rebuild(
         snapshot,
         manifest if manifest is not None else {},
@@ -441,19 +548,25 @@ def run_tick(
         runtime_corrupt=runtime_corrupt,
     )
 
-    if not snapshot.healthy or runtime_corrupt:
+    if not snapshot.healthy or runtime_corrupt or board_identity_mismatch:
         health_rec = dict(result["health"])
         health_rec["healthy"] = False
         health_rec["stale"] = True
         health_rec["live_dispatch_suppressed"] = True
         health_rec["as_of"] = result["as_of"]
         health_rec["last_good_snapshot_id"] = last_pub.get("snapshot_id") if last_pub else None
-        if runtime_corrupt:
+        if board_identity_mismatch:
+            health_rec["reason"] = "board_identity_changed"
+        elif runtime_corrupt:
             health_rec["reason"] = "runtime_corrupt"
         _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
-        # Preserve last good projection; surface stale health on board only if writable
-        with contextlib.suppress(OSError, board_state.PublishError):
-            board_state.publish_hub_projections(board_dir, result, healthy=False, health_record=health_rec)
+        # Preserve last good projection; surface stale health on board only when identity matches
+        if not board_identity_mismatch:
+            with contextlib.suppress(OSError, board_state.PublishError):
+                expected_id = (snapshot.root_dev, snapshot.root_ino) if snapshot.healthy else None
+                board_state.publish_hub_projections(
+                    board_dir, result, healthy=False, health_record=health_rec, expected_root_id=expected_id
+                )
         emit_log(
             f"ts={result['as_of']} route=watch status=unhealthy code={health_rec.get('reason', 'unknown')} duration_ms=0"
         )
@@ -467,6 +580,15 @@ def run_tick(
 
     # 3. Healthy tick: persist newly observed filenames in manifest (without altering existing ones)
     updated_manifest, manifest_changed = _update_manifest_with_new_entries(snapshot, manifest, now)
+    if not isinstance(updated_manifest.get("board_id"), str) and result["health"]["healthy"]:
+        # Legacy manifest upgrade: bind board_id once on a clean healthy tick with zero immutability issues
+        if not any(d["code"] == "IMMUTABILITY" for d in result["lint"]["diagnostics"]):
+            updated_manifest = dict(updated_manifest)
+            updated_manifest["board_id"] = _ensure_board_id(
+                board_dir, expected_root_id=(snapshot.root_dev, snapshot.root_ino)
+            )
+            manifest_changed = True
+    manifest_board_id = updated_manifest.get("board_id")
     if manifest_changed:
         board_state.save_manifest(runtime_dir / MANIFEST_NAME, updated_manifest)
         manifest = updated_manifest
@@ -568,7 +690,9 @@ def run_tick(
             _pre_wake_hook()
         for _obs_at, _sent_at, msg_uuid, agent in candidates:
             recheck_now = clock()
-            if not _verify_board_root_pinned(board_dir, snapshot.root_dev, snapshot.root_ino):
+            if not _verify_board_root_pinned(
+                board_dir, snapshot.root_dev, snapshot.root_ino, expected_board_id=manifest_board_id
+            ):
                 health_rec = dict(result["health"])
                 health_rec.update({
                     "healthy": False,
@@ -627,6 +751,9 @@ def run_tick(
             if (
                 not re_snap.healthy
                 or (re_snap.root_dev, re_snap.root_ino) != (snapshot.root_dev, snapshot.root_ino)
+                or not _verify_board_root_pinned(
+                    board_dir, snapshot.root_dev, snapshot.root_ino, expected_board_id=manifest_board_id
+                )
             ):
                 reason = re_snap.scan_error or "board_identity_changed"
                 if re_snap.healthy:
@@ -681,6 +808,32 @@ def run_tick(
                 continue
             if re_wl.check_rate_limit(agent, recheck_now) is not None:
                 continue
+
+            # Final identity pin at dispatch boundary before calling wake()
+            if not _verify_board_root_pinned(
+                board_dir, snapshot.root_dev, snapshot.root_ino, expected_board_id=manifest_board_id
+            ):
+                dispatch_now = clock()
+                health_rec = dict(result["health"])
+                health_rec.update({
+                    "healthy": False,
+                    "stale": True,
+                    "live_dispatch_suppressed": True,
+                    "reason": "board_identity_changed",
+                    "as_of": board_lint.format_utc_rfc3339(dispatch_now),
+                    "last_good_snapshot_id": last_pub.get("snapshot_id") if last_pub else None,
+                })
+                _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
+                emit_log(
+                    f"ts={health_rec['as_of']} route=watch status=unhealthy code=board_identity_changed duration_ms=0"
+                )
+                return {
+                    "exit_code": 2,
+                    "healthy": False,
+                    "reason": "board_identity_changed",
+                    "result": result,
+                    "wake_sent": None,
+                }
 
             outcome = wake_routes.wake(
                 agent,

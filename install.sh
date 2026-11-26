@@ -103,6 +103,7 @@ for file in \
     "$runtime_dir/housekeeping.json" \
     "$runtime_dir/routes.json" \
     "$runtime_dir/wake_ledger.json" \
+    "$runtime_dir/.wake_ledger.initialized" \
     "$runtime_dir/mail_ledger.json" \
     "$runtime_dir/mail_pending.json" \
     "$runtime_dir/health.json" \
@@ -163,7 +164,7 @@ chmod 600 "$tmp_plist"
 mv -f "$tmp_plist" "$agent"
 trap - EXIT
 
-if [[ ! -e "$runtime_dir/manifest.json" ]]; then
+if [[ ! -e "$runtime_dir/manifest.json" || ! -e "$runtime_dir/baseline.json" || ! -e "$runtime_dir/wake_ledger.json" ]]; then
     /usr/bin/python3 -I "$runtime_dir/board_watch.py" \
         --board "$board_dir" \
         --runtime-dir "$runtime_dir" \
