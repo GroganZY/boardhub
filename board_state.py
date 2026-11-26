@@ -641,7 +641,7 @@ def rebuild(
             "to": msg.recipient,
             "type": msg.msg_type,
             "sent_at": msg.sent_at,
-            "needs_human": "yes" if msg.needs_human else "no",
+            "needs_user": "yes" if msg.needs_user else "no",
             "task": msg.task_label,
             "assignee": msg.assignee,
             "reviewer": msg.reviewer,
@@ -775,10 +775,10 @@ def rebuild(
             }
             pending_all.append(pending_entry)
 
-        if root.needs_human:
+        if root.needs_user:
             paused = True
-            pause_reason = "needs_human"
-            _open_pending("needs_human", root.request_id, root.sent_at)
+            pause_reason = "needs_user"
+            _open_pending("needs_user", root.request_id, root.sent_at)
 
         while True:
             raw_candidates = children_by_prev.get(current_head, [])
@@ -907,11 +907,11 @@ def rebuild(
                         if revise_count >= 2:
                             revise_paused = True
 
-            # Pause checks AFTER applying event (explicit needs_human still appears even if closing task)
-            if chosen.needs_human:
+            # Pause checks AFTER applying event (explicit needs_user still appears even if closing task)
+            if chosen.needs_user:
                 paused = True
-                pause_reason = "needs_human"
-                _open_pending("needs_human", chosen.request_id, chosen.sent_at)
+                pause_reason = "needs_user"
+                _open_pending("needs_user", chosen.request_id, chosen.sent_at)
             elif revise_paused:
                 paused = True
                 pause_reason = "second_revise"
@@ -1037,7 +1037,7 @@ def rebuild(
             "type": msg.msg_type,
             "sent_at": msg.sent_at,
             "first_observed_at": board_lint.format_utc_rfc3339(obs_dt),
-            "needs_human": msg.needs_human,
+            "needs_user": msg.needs_user,
             "task_label": task_info["label"] if task_info else thr_info["task_label"],
             "task_state": task_info["state"] if task_info else None,
             "thread_paused": thr_info["paused"],
@@ -1226,7 +1226,7 @@ def _validate_candidate(
             if cand.sender not in participants:
                 return "ROLE"
             if cand.recipient not in participants:
-                if not (cand.recipient == board_lint.HUMAN_ROLE and cand.needs_human):
+                if not (cand.recipient == board_lint.HUMAN_ROLE and cand.needs_user):
                     return "ROLE"
         return None
 
@@ -1409,8 +1409,8 @@ def render_inbox_markdown(agent: str, result: dict) -> str:
             flags = []
             if item["is_broadcast"]:
                 flags.append("broadcast")
-            if item["needs_human"]:
-                flags.append("needs_human")
+            if item["needs_user"]:
+                flags.append("needs_user")
             if item["thread_paused"]:
                 flags.append("paused")
             if item["thread_terminal"]:
@@ -1428,10 +1428,15 @@ def render_inbox_markdown(agent: str, result: dict) -> str:
 
 # --- Atomic _hub projection publisher (state.json published LAST) ---
 
-def _ensure_safe_hub_dir(board_dir: Path) -> Path:
+def _ensure_safe_hub_dir(
+    board_dir: Path,
+    expected_root_id: Optional[Tuple[int, int]] = None,
+) -> Path:
     board_info = board_dir.lstat()
     if stat.S_ISLNK(board_info.st_mode) or not stat.S_ISDIR(board_info.st_mode):
         raise PublishError("Board directory is not a regular directory.")
+    if expected_root_id is not None and (board_info.st_dev, board_info.st_ino) != expected_root_id:
+        raise PublishError("Board root directory identity changed before publish.")
     hub_dir = board_dir / "_hub"
     try:
         hinfo = hub_dir.lstat()
@@ -1487,10 +1492,11 @@ def publish_hub_projections(
     result: dict,
     healthy: bool = True,
     health_record: Optional[dict] = None,
+    expected_root_id: Optional[Tuple[int, int]] = None,
 ) -> None:
     """Publish _hub projections atomically with state.json written LAST; preserve good state if unhealthy."""
     board_path = Path(board_dir)
-    hub_dir = _ensure_safe_hub_dir(board_path)
+    hub_dir = _ensure_safe_hub_dir(board_path, expected_root_id=expected_root_id)
 
     if not healthy:
         if health_record is not None:
@@ -1532,6 +1538,13 @@ def _get_publish_lock(board_dir: Path, message_uuid: str) -> threading.Lock:
         return lock
 
 
+def _link_supports_hardlinks(dir_path: Path) -> bool:
+    try:
+        return os.path.supports_follow_symlinks and os.pathconf(str(dir_path), "PC_LINK_MAX") > 1
+    except OSError:
+        return True
+
+
 def publish_message(
     board_dir: Path,
     number: int,
@@ -1542,6 +1555,7 @@ def publish_message(
     sync_dir: bool = True,
     _fsync_file_fn=os.fsync,
     _fsync_dir_fn=None,
+    _before_publish_hook=None,
 ) -> dict:
     """Atomically publish a v2 board message with per-UUID retry serialization & conflict detection."""
     if not isinstance(number, int) or isinstance(number, bool) or not 0 <= number <= 9999:
@@ -1593,6 +1607,7 @@ def publish_message(
         except OSError as exc:
             raise DurabilityError(f"Failed creating temp message file: {exc}") from exc
 
+        created_final_exclusively = False
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(raw)
@@ -1602,7 +1617,7 @@ def publish_message(
                 except OSError as exc:
                     raise DurabilityError(f"File fsync failed: {exc}") from exc
 
-            # Re-check existing UUID files before rename so we never replace or renumber
+            # Re-check existing UUID files before publishing final name so we never replace or renumber
             existing_now = sorted(
                 name for name in os.listdir(board_path)
                 if not name.startswith(".") and name.endswith(f"--{message_uuid}.md")
@@ -1613,10 +1628,47 @@ def publish_message(
                 targets = existing_now or [final_name]
                 return _verify_existing_publication(board_path, targets, raw, from_agent, to_agent, message_uuid)
 
-            os.replace(tmp_path, final_path)
+            if _before_publish_hook is not None:
+                _before_publish_hook()
+
+            try:
+                os.link(tmp_path, final_path)
+            except FileExistsError:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
+                return _verify_existing_publication(board_path, [final_name], raw, from_agent, to_agent, message_uuid)
+            except OSError as exc:
+                unsupported_link = (
+                    exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EMLINK)
+                    or (exc.errno == errno.EPERM and not _link_supports_hardlinks(board_path))
+                )
+                if not unsupported_link:
+                    raise
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
+                try:
+                    final_fd = os.open(final_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                except FileExistsError:
+                    return _verify_existing_publication(board_path, [final_name], raw, from_agent, to_agent, message_uuid)
+                except OSError as open_exc:
+                    raise DurabilityError(f"Failed creating exclusive message file: {open_exc}") from open_exc
+                created_final_exclusively = True
+                with os.fdopen(final_fd, "wb") as handle:
+                    handle.write(raw)
+                    handle.flush()
+                    try:
+                        _fsync_file_fn(handle.fileno())
+                    except OSError as fsync_exc:
+                        raise DurabilityError(f"File fsync failed: {fsync_exc}") from fsync_exc
+            else:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
         except BaseException:
             with contextlib.suppress(OSError):
                 tmp_path.unlink()
+            if created_final_exclusively:
+                with contextlib.suppress(OSError):
+                    final_path.unlink()
             raise
 
         if sync_dir:

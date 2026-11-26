@@ -59,7 +59,7 @@ class BoardChatV2AndDeliverablesTests(unittest.TestCase):
         (self.board / f"0001_claude_main_to_claude_side--{u_t1}.md").write_text(
             "---\nv: 2\nfrom: claude_main\nto: claude_side\ntype: task\n"
             f"request_id: {u_t1}\nthread: {u_t1}\nprev: none\n"
-            "sent_at: 2026-11-24T00:00:00Z\nneeds_human: no\n"
+            "sent_at: 2026-11-24T00:00:00Z\nneeds_user: no\n"
             "assignee: claude_side\nreviewer: codex\nkind: coordination\n"
             'task: "><script>alert(1)</script>\n---\n\n'
             "# <script>alert(2)</script>\n"
@@ -75,14 +75,14 @@ class BoardChatV2AndDeliverablesTests(unittest.TestCase):
             (self.board / f"{num:04d}_claude_side_to_claude_main--{uid}.md").write_text(
                 "---\nv: 2\nfrom: claude_side\nto: claude_main\ntype: state\n"
                 f"request_id: {uid}\nthread: {u_t1}\nprev: {prev}\n"
-                "sent_at: 2026-11-24T01:00:00Z\nneeds_human: no\n"
+                "sent_at: 2026-11-24T01:00:00Z\nneeds_user: no\n"
                 f"state: {st}\n---\n\nmoving to {st}\n",
                 encoding="utf-8",
             )
         (self.board / f"0004_claude_side_to_codex--{u_d1}.md").write_text(
             "---\nv: 2\nfrom: claude_side\nto: codex\ntype: delivery\n"
             f"request_id: {u_d1}\nthread: {u_t1}\nprev: {u_c2}\n"
-            "sent_at: 2026-11-24T02:00:00Z\nneeds_human: yes\n---\n\nready for review\n",
+            "sent_at: 2026-11-24T02:00:00Z\nneeds_user: yes\n---\n\nready for review\n",
             encoding="utf-8",
         )
         # Separate message for claude_main only (must NOT appear in claude_side inbox)
@@ -90,7 +90,7 @@ class BoardChatV2AndDeliverablesTests(unittest.TestCase):
         (self.board / f"0005_codex_to_claude_main--{u_m1}.md").write_text(
             "---\nv: 2\nfrom: codex\nto: claude_main\ntype: info\n"
             f"request_id: {u_m1}\nthread: {u_m1}\nprev: none\n"
-            "sent_at: 2026-11-26T05:00:00Z\nneeds_human: no\n---\n\nfor main only\n",
+            "sent_at: 2026-11-26T05:00:00Z\nneeds_user: no\n---\n\nfor main only\n",
             encoding="utf-8",
         )
         # Legacy ambiguous numeric ref
@@ -148,7 +148,7 @@ class BoardChatV2AndDeliverablesTests(unittest.TestCase):
         (self.board / f"0001_claude_main_to_dsh--{u1}.md").write_text(
             "---\nv: 2\nfrom: claude_main\nto: dsh\ntype: info\n"
             f"request_id: {u1}\nthread: {u1}\nprev: none\n"
-            "sent_at: 2026-11-26T05:00:00Z\nneeds_human: no\n---\n\nhello\n",
+            "sent_at: 2026-11-26T05:00:00Z\nneeds_user: no\n---\n\nhello\n",
             encoding="utf-8",
         )
         runtime = Path(self.tmp.name) / "rt"
@@ -185,6 +185,38 @@ class BoardChatV2AndDeliverablesTests(unittest.TestCase):
         )
         self.assertEqual(chat_proc.returncode, 0, chat_proc.stderr)
         self.assertIn("待 maintainer 处理", html_out.read_text(encoding="utf-8"))
+
+    def test_legacy_and_v2_needs_grogan_user_human_highlight_and_filterable(self):
+        self.addCleanup(board_lint.configure_human_role, board_lint.DEFAULT_HUMAN_ROLE)
+        board_lint.configure_human_role("grogan")
+        (self.board / "0001_codex_to_all.md").write_text(
+            "---\nfrom: codex\nto: all\nneeds_grogan: yes\n---\nlegacy grogan\n",
+            encoding="utf-8",
+        )
+        (self.board / "0002_codex_to_all.md").write_text(
+            "---\nfrom: codex\nto: all\nneeds_human: yes\n---\nlegacy human\n",
+            encoding="utf-8",
+        )
+        (self.board / "0003_codex_to_all.md").write_text(
+            "---\nfrom: codex\nto: all\nneeds_user: yes\n---\nlegacy user\n",
+            encoding="utf-8",
+        )
+        u_v2_g = make_uuid(850)
+        (self.board / f"0004_claude_main_to_grogan--{u_v2_g}.md").write_text(
+            "---\nv: 2\nfrom: claude_main\nto: grogan\ntype: info\n"
+            f"request_id: {u_v2_g}\nthread: {u_v2_g}\nprev: none\n"
+            "sent_at: 2026-11-26T05:00:00Z\nneeds_grogan: yes\n---\n\nv2 grogan\n",
+            encoding="utf-8",
+        )
+
+        board_chat_v2.generate(self.board, self.out, as_of=datetime(2026, 11, 26, 6, 0, 0, tzinfo=timezone.utc))
+        html_text = self.out.read_text(encoding="utf-8")
+        articles = [attrs for tag, attrs in TagInspector(html_text).tags if tag == "article"]
+        self.assertEqual(len(articles), 4)
+        for attrs in articles:
+            self.assertIn("needs", attrs.get("class", "").split())
+            self.assertEqual(attrs.get("data-human"), "yes")
+        self.assertEqual(html_text.count('<span class="badge attention">需要 grogan</span>'), 4)
 
 
 if __name__ == "__main__":

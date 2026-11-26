@@ -4,12 +4,15 @@
 Python 3.8+ standard library only.
 """
 
+import contextlib
 from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import pwd
 import re
+import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -248,27 +251,85 @@ def run_agy_client_send(
     env = _minimal_child_env(home_dir=home_dir)
 
     try:
-        proc = subprocess.run(
+        child = subprocess.Popen(
             argv,
             shell=False,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        return "uncertain", "outer_timeout"
     except OSError:
         return "not_sent", "client_start_failed"
 
-    if len(proc.stdout) > MAX_CLIENT_OUTPUT_BYTES or len(proc.stderr) > MAX_CLIENT_OUTPUT_BYTES:
-        return "uncertain", "output_limit_exceeded"
+    stdout_buf = bytearray()
+    stderr_buf = bytearray()
+    deadline = time.monotonic() + timeout
+    completed = False
+    overflow = False
+    timed_out = False
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ, stdout_buf)
+            selector.register(child.stderr, selectors.EVENT_READ, stderr_buf)
+            while selector.get_map():
+                remaining_time = deadline - time.monotonic()
+                if remaining_time <= 0:
+                    timed_out = True
+                    break
+                events = selector.select(remaining_time)
+                if not events:
+                    timed_out = True
+                    break
+                for key, _ in events:
+                    buf = key.data
+                    cap_left = MAX_CLIENT_OUTPUT_BYTES - len(buf)
+                    try:
+                        chunk = os.read(key.fd, min(65536, cap_left + 1))
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    elif len(chunk) > cap_left:
+                        overflow = True
+                        break
+                    else:
+                        buf.extend(chunk)
+                if overflow:
+                    break
+
+        if timed_out:
+            return "uncertain", "outer_timeout"
+        if overflow:
+            return "uncertain", "output_limit_exceeded"
+
+        remaining_time = deadline - time.monotonic()
+        if remaining_time <= 0:
+            return "uncertain", "outer_timeout"
+        returncode = child.wait(timeout=remaining_time)
+        completed = True
+    except subprocess.TimeoutExpired:
+        return "uncertain", "outer_timeout"
+    except OSError:
+        return "uncertain", "client_io_failed"
+    finally:
+        if not completed:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(child.pid, signal.SIGKILL)
+            with contextlib.suppress(OSError):
+                child.kill()
+        with contextlib.suppress(OSError):
+            child.stdout.close()
+        with contextlib.suppress(OSError):
+            child.stderr.close()
+        if not completed:
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                child.wait(timeout=1)
 
     try:
         reply = board_lint.decode_json_strict(
-            proc.stdout.strip(),
+            bytes(stdout_buf).strip(),
             max_bytes=MAX_CLIENT_OUTPUT_BYTES,
             max_depth=12,
         )
@@ -278,7 +339,7 @@ def run_agy_client_send(
     if not isinstance(reply, dict) or type(reply.get("ok")) is not bool:
         return "uncertain", "malformed_response"
 
-    if proc.returncode == 0 and reply.get("ok") is True:
+    if returncode == 0 and reply.get("ok") is True:
         return "accepted", "accepted"
 
     if reply.get("ok") is False:
@@ -297,6 +358,23 @@ def run_agy_client_send(
 
 # --- APFS Wake Ledger ---
 
+WAKE_LEDGER_INIT_MARKER = ".wake_ledger.initialized"
+
+
+def is_wake_ledger_initialized(runtime_dir: Path) -> bool:
+    """Return True if runtime_dir has previously initialized a wake ledger or runtime baseline."""
+    rdir = Path(runtime_dir)
+    for name in (WAKE_LEDGER_INIT_MARKER, "manifest.json", "baseline.json", "last_published.json"):
+        try:
+            os.lstat(rdir / name)
+            return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+    return False
+
+
 class WakeLedger:
     """Durable APFS wake ledger tracking attempts, retries, rate caps, and route opt-in baselines."""
 
@@ -305,7 +383,12 @@ class WakeLedger:
         self.state = state
 
     @classmethod
-    def load(cls, path: Path, now: Optional[datetime] = None) -> Tuple["WakeLedger", bool]:
+    def load(
+        cls,
+        path: Path,
+        now: Optional[datetime] = None,
+        allow_missing: bool = False,
+    ) -> Tuple["WakeLedger", bool]:
         """Load wake ledger, converting any leftover 'attempting' records to 'uncertain'."""
         path = Path(path)
         try:
@@ -314,7 +397,9 @@ class WakeLedger:
             return cls(path, cls._empty_state()), True
 
         if obj is None:
-            return cls(path, cls._empty_state()), False
+            if allow_missing:
+                return cls(path, cls._empty_state()), False
+            return cls(path, cls._empty_state()), True
 
         if (
             obj.get("version") != SCHEMA_VERSION
@@ -356,6 +441,9 @@ class WakeLedger:
     def save(self) -> None:
         payload = (json.dumps(self.state, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
         board_lint.atomic_write_private_file(self.path, payload, mode=0o600)
+        marker = self.path.parent / WAKE_LEDGER_INIT_MARKER
+        if not marker.exists() and not marker.is_symlink():
+            board_lint.atomic_write_private_file(marker, b"initialized\n", mode=0o600)
 
     @staticmethod
     def _key(agent: str, message_uuid: str) -> str:
@@ -545,6 +633,7 @@ def wake(
     now_fn: Optional[Callable[[], datetime]] = None,
     agy_runner: Optional[Callable[..., Tuple[str, str]]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
+    require_existing_ledger: Optional[bool] = None,
 ) -> str:
     """Dispatch a single validated wake notification according to APFS route config & ledger.
 
@@ -583,9 +672,19 @@ def wake(
 
     ledger: Optional[WakeLedger] = None
     if runtime_dir is not None:
-        ledger_path = Path(runtime_dir) / "wake_ledger.json"
-        ledger, ledger_corrupt = WakeLedger.load(ledger_path, now=now)
+        rdir = Path(runtime_dir)
+        ledger_path = rdir / "wake_ledger.json"
+        if require_existing_ledger is None:
+            allow_missing = not is_wake_ledger_initialized(rdir)
+        else:
+            allow_missing = not require_existing_ledger
+        ledger, ledger_corrupt = WakeLedger.load(ledger_path, now=now, allow_missing=allow_missing)
         if ledger_corrupt:
+            if log_fn is not None:
+                log_fn(
+                    f"ts={board_lint.format_utc_rfc3339(now)} route={route['adapter']} "
+                    f"agent={agent} uuid={message_uuid} status=not_sent code=wake_ledger_missing_or_corrupt duration_ms=0"
+                )
             return "not_sent"
         if not ledger.is_eligible(agent, message_uuid, now):
             rec = ledger.get_record(agent, message_uuid)
@@ -676,6 +775,9 @@ class MailLedger:
     def save(self) -> None:
         payload = (json.dumps(self.state, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
         board_lint.atomic_write_private_file(self.path, payload, mode=0o600)
+        marker = self.path.parent / WAKE_LEDGER_INIT_MARKER
+        if not marker.exists() and not marker.is_symlink():
+            board_lint.atomic_write_private_file(marker, b"initialized\n", mode=0o600)
 
     def begin_submission(self, item_ids: List[str], snapshot_id: str, now: Optional[datetime] = None) -> str:
         if not item_ids or any(not isinstance(i, str) or not i for i in item_ids):

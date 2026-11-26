@@ -192,9 +192,9 @@ COMMON_V2_REQUIRED = (
     "thread",
     "prev",
     "sent_at",
-    "needs_human",
 )
-KNOWN_V2_FIELDS = frozenset(COMMON_V2_REQUIRED) | frozenset({
+NEEDS_USER_FIELDS = ("needs_user", "needs_grogan", "needs_human")
+KNOWN_V2_FIELDS = frozenset(COMMON_V2_REQUIRED) | frozenset(NEEDS_USER_FIELDS) | frozenset({
     "re",
     "task",
     "supersedes",
@@ -672,6 +672,8 @@ class BoardSnapshot:
     entries: Dict[str, SnapshotEntry] = field(default_factory=dict)
     unsafe_entries: Dict[str, UnsafeEntry] = field(default_factory=dict)
     scan_error: Optional[str] = None
+    root_dev: Optional[int] = None
+    root_ino: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -693,7 +695,7 @@ class ParsedV2Message:
     prev: str
     sent_at: str
     sent_at_dt: datetime
-    needs_human: bool
+    needs_user: bool
     re: Optional[str]
     task_label: Optional[str]
     supersedes: Optional[str]
@@ -988,10 +990,13 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
     if sent_at_dt is None:
         return None, [_v2_fail("FORMAT", filename, req_id, thread)]
 
-    nh_raw = meta["needs_human"]
-    if nh_raw not in ("yes", "no"):
+    present_needs = [key for key in NEEDS_USER_FIELDS if key in meta]
+    if len(present_needs) != 1:
         return None, [_v2_fail("FORMAT", filename, req_id, thread)]
-    needs_human = nh_raw == "yes"
+    nu_raw = meta[present_needs[0]]
+    if nu_raw not in ("yes", "no"):
+        return None, [_v2_fail("FORMAT", filename, req_id, thread)]
+    needs_user = nu_raw == "yes"
 
     # Root vs non-root consistency
     is_root = prev == "none"
@@ -1034,7 +1039,7 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
         "question": {"task", "re"},
         "answer": {"re"},
     }[msg_type]
-    extra_keys = set(meta.keys()) - set(COMMON_V2_REQUIRED) - allowed_type_fields
+    extra_keys = set(meta.keys()) - set(COMMON_V2_REQUIRED) - set(NEEDS_USER_FIELDS) - allowed_type_fields
     if extra_keys:
         return None, [_v2_fail("FORMAT", filename, req_id, thread)]
 
@@ -1146,7 +1151,7 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
         prev=prev,
         sent_at=sent_at_str,
         sent_at_dt=sent_at_dt,
-        needs_human=needs_human,
+        needs_user=needs_user,
         re=re_id,
         task_label=task_label,
         supersedes=supersedes,
@@ -1174,12 +1179,29 @@ def _stat_signature(info: os.stat_result) -> tuple:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def _single_scan_pass(board_dir: Path) -> Tuple[Dict[str, SnapshotEntry], Dict[str, UnsafeEntry]]:
+class _BoardIdentityError(OSError):
+    pass
+
+
+def _root_identity(info: os.stat_result) -> Tuple[int, int]:
+    return (info.st_dev, info.st_ino)
+
+
+def _single_scan_pass(
+    board_dir: Path,
+    expected_root_id: Optional[Tuple[int, int]] = None,
+) -> Tuple[Dict[str, SnapshotEntry], Dict[str, UnsafeEntry], Tuple[int, int]]:
     entries: Dict[str, SnapshotEntry] = {}
     unsafe_entries: Dict[str, UnsafeEntry] = {}
 
     dir_fd = os.open(board_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        dir_info = os.fstat(dir_fd)
+        if not stat.S_ISDIR(dir_info.st_mode):
+            raise _BoardIdentityError("Board path is not a directory")
+        root_id = _root_identity(dir_info)
+        if expected_root_id is not None and root_id != expected_root_id:
+            raise _BoardIdentityError("Board root identity changed")
         names = sorted(os.listdir(dir_fd))
         for name in names:
             if _is_ignored_entry(name):
@@ -1235,9 +1257,12 @@ def _single_scan_pass(board_dir: Path) -> Tuple[Dict[str, SnapshotEntry], Dict[s
                 mtime_ns=before.st_mtime_ns,
                 oversize_legacy=(not is_v2_cand and len(raw) > cap),
             )
+        dir_info_end = os.fstat(dir_fd)
+        if _root_identity(dir_info_end) != root_id:
+            raise _BoardIdentityError("Board root identity changed during scan")
     finally:
         os.close(dir_fd)
-    return entries, unsafe_entries
+    return entries, unsafe_entries, root_id
 
 
 def scan_board(board_dir: Path, _second_pass_hook=None) -> BoardSnapshot:
@@ -1250,11 +1275,19 @@ def scan_board(board_dir: Path, _second_pass_hook=None) -> BoardSnapshot:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         return BoardSnapshot(healthy=False, board_dir=str(board_path), scan_error="board_not_directory")
 
+    expected_root_id = _root_identity(info)
     try:
-        entries_1, unsafe_1 = _single_scan_pass(board_path)
+        entries_1, unsafe_1, id_1 = _single_scan_pass(board_path, expected_root_id=expected_root_id)
         if _second_pass_hook is not None:
             _second_pass_hook()
-        entries_2, unsafe_2 = _single_scan_pass(board_path)
+        entries_2, unsafe_2, id_2 = _single_scan_pass(board_path, expected_root_id=expected_root_id)
+        info_end = board_path.lstat()
+        if stat.S_ISLNK(info_end.st_mode) or not stat.S_ISDIR(info_end.st_mode):
+            return BoardSnapshot(healthy=False, board_dir=str(board_path), scan_error="board_not_directory")
+        if id_1 != expected_root_id or id_2 != expected_root_id or _root_identity(info_end) != expected_root_id:
+            return BoardSnapshot(healthy=False, board_dir=str(board_path), scan_error="board_identity_changed")
+    except _BoardIdentityError:
+        return BoardSnapshot(healthy=False, board_dir=str(board_path), scan_error="board_identity_changed")
     except OSError:
         return BoardSnapshot(healthy=False, board_dir=str(board_path), scan_error="scan_io_or_race")
 
@@ -1275,6 +1308,8 @@ def scan_board(board_dir: Path, _second_pass_hook=None) -> BoardSnapshot:
         entries=entries_2,
         unsafe_entries=unsafe_2,
         scan_error=None,
+        root_dev=expected_root_id[0],
+        root_ino=expected_root_id[1],
     )
 
 

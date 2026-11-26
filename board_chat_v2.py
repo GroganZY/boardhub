@@ -581,7 +581,7 @@ def _render_dashboard(result: dict) -> str:
 
 def _render_v2_card(rec: dict) -> str:
     sender, recipient = rec["from"], rec["to"]
-    needs = rec["needs_human"] == "yes"
+    needs = any(rec.get(k) == "yes" for k in ("needs_user", "needs_grogan", "needs_human"))
     status = rec["status"]
     classes = "message v2"
     if needs:
@@ -659,7 +659,10 @@ def _render_legacy_card(msg: dict) -> str:
     body = msg["body"]
     sender = meta.get("from", "")
     recipient = meta.get("to", "")
-    needs = board_lint.is_yes(meta.get("needs_human", ""))
+    needs = any(
+        board_lint.is_yes(meta.get(k, ""))
+        for k in ("needs_user", "needs_grogan", "needs_human")
+    )
     urgent = board_lint.is_yes(meta.get("urgent", ""))
     classes = "message legacy" + (" needs" if needs else "") + (" rejected" if urgent else "")
 

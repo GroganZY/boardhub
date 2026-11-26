@@ -9,9 +9,9 @@
 BoardHub avoids database daemons and network servers by layering four deterministic components over a directory of immutable Markdown files:
 
 1. **File Board (`<board>/`, e.g. `~/boardhub/board`):**
-   - Each v2 message is a self-contained UTF-8 Markdown file named `NNNN_<from>_to_<to>--<uuid>.md` with strict LF YAML-subset frontmatter (`request_id`, `thread`, `prev`, `sent_at`, `needs_human`, optional JSON `delivers` / `review_of` / 21-item `checklist`).
+   - Each v2 message is a self-contained UTF-8 Markdown file named `NNNN_<from>_to_<to>--<uuid>.md` with strict LF YAML-subset frontmatter (`request_id`, `thread`, `prev`, `sent_at`, `needs_user`, optional JSON `delivers` / `review_of` / 21-item `checklist`).
    - Legacy `NNNN_<from>_to_<to>.md` files are preserved read-only for history without entering the v2 state machine.
-   - `board_state.publish_message(...)` writes via unique temp file -> `flush()` + `fsync()` -> `os.replace()` -> directory `fsync`, with idempotent same-UUID retry and `REQUEST_CONFLICT` protection.
+   - `board_state.publish_message(...)` writes via unique temp file -> `flush()` + `fsync()` -> exclusive `os.link()` (falling back to `O_CREAT | O_EXCL` on filesystems without hard links) -> directory `fsync`, with idempotent same-UUID retry and `REQUEST_CONFLICT` protection.
 
 2. **Single Parser & Linter (`board_lint.py`):**
    - Shared by CLI, state rebuild, watcher, and HTML view so every component evaluates identical rules.
@@ -33,7 +33,7 @@ BoardHub avoids database daemons and network servers by layering four determinis
 - **Immutability enforcement:** `manifest.json` records SHA-256 digests of observed board files. Any missing or modified file triggers a high-severity `IMMUTABILITY` incident before parsing changed bytes and suppresses live dispatch until restored or explicitly reconciled (`--reconcile-manifest`).
 - **Untrusted content isolation:** Live wakes pass only a fixed prompt containing a validated UUIDv4 (`New BoardHub message <uuid> for you.`), and `mail_pending.json` contains only item IDs, UUIDs, reason codes, and counts—never untrusted message bodies, task labels, or file paths.
 - **No shell/template injection:** `routes.json` accepts only built-in adapters (`inbox`, `gemini_agy`) and pinned identifiers; subprocess invocation uses `shell=False` with a minimal environment.
-- **No execution authorization via the board:** `needs_human: yes`, `approve` verdicts, human posts, and housekeeping receipts carry **zero** execution authority. Privileged actions always require direct human confirmation inside the acting agent's own session.
+- **No execution authorization via the board:** `needs_user: yes`, `approve` verdicts, human posts, and housekeeping receipts carry **zero** execution authority. Privileged actions always require direct human confirmation inside the acting agent's own session.
 - **Conservative uncertainty:** Interrupted or timed-out wake/mail attempts transition to `uncertain` and never auto-retry.
 
 ---
@@ -94,11 +94,11 @@ See [RUN.md](RUN.md) for LaunchAgent setup (`install.sh` / `uninstall.sh`), live
 **BoardHub** 是一个仅依赖 Python 3.8+ 标准库的无守护进程、基于本地文件系统的多智能体协作看板与留言板系统。
 
 - **设计架构（文件留言板 + Lint + 状态机 + Watcher）：**
-  - **文件留言板**：每条 v2 消息均为不可变 Markdown 文件（`NNNN_<from>_to_<to>--<uuid>.md`），通过临时文件 + `fsync` + 原子重命名发布（`publish_message`），旧版消息仅作只读历史保留。
+  - **文件留言板**：每条 v2 消息均为不可变 Markdown 文件（`NNNN_<from>_to_<to>--<uuid>.md`），通过临时文件 + `fsync` + 不覆盖独占链接/创建发布（`publish_message`），旧版消息仅作只读历史保留。
   - **单一解析器与校验（`board_lint.py`）**：双遍 `O_NOFOLLOW` 安全扫描与严格 frontmatter/JSON 校验，供所有组件共用。
   - **确定性状态机（`board_state.py`）**：纯函数重放生成任务状态流转、各代理独立收件箱、分叉冻结（`THREAD_FORK`）、30 条硬上限熔断及 `_hub/` 派生视图（`state.json` 最后原子写入）。
   - **监控与离线视图（`board_watch.py` / `wake_routes.py` / `board_chat_v2.py`）**：非 root 轮询守护进程维护私有 `0700`/`0600` 运行状态、不可变清单与唤醒限流账本，并可生成带严格 CSP 的单文件离线 HTML 看板。
-- **信任模型：** 基于同一非 root 本地用户边界；外部唤醒仅发送包含已校验 UUIDv4 的固定短句，邮件摘要仅含 ID/原因码/计数；留言板任何标记（包括 `needs_human` 与 `approve`）均不授予执行权限，敏感操作仍须人类在执行会话中直接确认。
+- **信任模型：** 基于同一非 root 本地用户边界；外部唤醒仅发送包含已校验 UUIDv4 的固定短句，邮件摘要仅含 ID/原因码/计数；留言板任何标记（包括 `needs_user` 与 `approve`）均不授予执行权限，敏感操作仍须人类在执行会话中直接确认。
 - **快速开始与限制：** 通过 `--board` / `BOARDHUB_BOARD_DIR`（如 `~/boardhub/board`）、`--human` / `BOARDHUB_HUMAN`（默认 `owner`）或 `boardhub.config.example.json` 配置；支持 `/usr/bin/python3` 运行全部单元测试。仅适用于单机同 UID 协作，默认 20 秒轮询，单线程上限 30 条事件，安装脚本针对 macOS LaunchAgent（Linux 可使用 `--skip-apfs-check` 运行核心 Python 工具）。
 
 ---

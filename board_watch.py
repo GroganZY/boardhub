@@ -77,12 +77,15 @@ def ensure_non_root() -> None:
 
 
 def verify_apfs_residence(path: Path) -> None:
-    """Verify default runtime directory resides on APFS (macOS)."""
+    """Verify runtime directory (default or custom) resides on APFS (macOS)."""
     if sys.platform != "darwin":
         return
+    probe = Path(path)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
     try:
         df_res = subprocess.run(
-            ["/bin/df", "-P", str(path)],
+            ["/bin/df", "-P", str(probe)],
             shell=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -228,6 +231,32 @@ def _update_manifest_with_new_entries(
     return updated, True
 
 
+def _verify_board_root_pinned(
+    board_dir: Path,
+    expected_dev: Optional[int],
+    expected_ino: Optional[int],
+) -> bool:
+    if expected_dev is None or expected_ino is None:
+        return False
+    board_path = Path(board_dir)
+    try:
+        linfo = board_path.lstat()
+        if stat.S_ISLNK(linfo.st_mode) or not stat.S_ISDIR(linfo.st_mode):
+            return False
+        dir_fd = os.open(board_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            finfo = os.fstat(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(finfo.st_mode)
+        and (linfo.st_dev, linfo.st_ino) == (expected_dev, expected_ino)
+        and (finfo.st_dev, finfo.st_ino) == (expected_dev, expected_ino)
+    )
+
+
 def bootstrap_runtime(
     board_dir: Path,
     runtime_dir: Path,
@@ -236,6 +265,7 @@ def bootstrap_runtime(
     """Explicitly bootstrap APFS manifest, baseline (inbox-only), route baselines, and _hub views."""
     ensure_non_root()
     runtime_dir = board_lint.verify_runtime_dir(runtime_dir, expected_mode=0o700, create=True)
+    already_init = wake_routes.is_wake_ledger_initialized(runtime_dir)
     now = as_of or datetime.now(timezone.utc)
 
     snapshot = board_lint.scan_board(board_dir)
@@ -265,9 +295,13 @@ def bootstrap_runtime(
     baseline_uuids = _extract_accepted_uuids(pre_result)
     _save_baseline(runtime_dir / BASELINE_NAME, baseline_uuids, now)
 
-    wake_ledger, wake_corrupt = wake_routes.WakeLedger.load(runtime_dir / WAKE_LEDGER_NAME, now=now)
+    wake_ledger, wake_corrupt = wake_routes.WakeLedger.load(
+        runtime_dir / WAKE_LEDGER_NAME,
+        now=now,
+        allow_missing=not already_init,
+    )
     if wake_corrupt:
-        raise WatcherError("Wake ledger is corrupt during bootstrap.")
+        raise WatcherError("Wake ledger is corrupt or missing during bootstrap.")
     wake_ledger.sync_route_baselines(route_cfg, baseline_uuids, now)
     wake_ledger.save()
 
@@ -346,6 +380,7 @@ def run_tick(
     agy_runner: Optional[Callable[..., Tuple[str, str]]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
     allow_wake: bool = True,
+    _pre_wake_hook: Optional[Callable[[], None]] = None,
 ) -> dict:
     """Execute one polling tick safely: scan -> rebuild -> publish -> at most 1 live wake."""
     ensure_non_root()
@@ -359,12 +394,29 @@ def run_tick(
     baseline_uuids, b_corrupt = _load_baseline(runtime_dir / BASELINE_NAME)
     hk_ids, _hk_obj, hk_corrupt = board_state.load_housekeeping_receipts(runtime_dir / HOUSEKEEPING_NAME)
     route_cfg, r_corrupt = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
-    wake_ledger, wl_corrupt = wake_routes.WakeLedger.load(runtime_dir / WAKE_LEDGER_NAME, now=now)
+    ledger_initialized = (
+        wake_routes.is_wake_ledger_initialized(runtime_dir)
+        or manifest is not None
+        or m_corrupt
+        or baseline_uuids is not None
+        or b_corrupt
+    )
+    wake_ledger, wl_corrupt = wake_routes.WakeLedger.load(
+        runtime_dir / WAKE_LEDGER_NAME,
+        now=now,
+        allow_missing=not ledger_initialized,
+    )
     mail_ledger, ml_corrupt = wake_routes.MailLedger.load(runtime_dir / MAIL_LEDGER_NAME, now=now)
     last_pub, lp_corrupt = _read_last_published(runtime_dir / LAST_PUBLISHED_NAME)
 
-    not_bootstrapped = (manifest is None and not m_corrupt) or (baseline_uuids is None and not b_corrupt)
+    not_bootstrapped = (
+        not ledger_initialized
+        and manifest is None and not m_corrupt
+        and baseline_uuids is None and not b_corrupt
+    )
     runtime_corrupt = any((m_corrupt, b_corrupt, hk_corrupt, r_corrupt, wl_corrupt, ml_corrupt, lp_corrupt))
+    if ledger_initialized and (manifest is None or baseline_uuids is None):
+        runtime_corrupt = True
 
     if not_bootstrapped:
         health_rec = {
@@ -472,7 +524,13 @@ def run_tick(
     )
     if need_publish:
         try:
-            board_state.publish_hub_projections(board_dir, result, healthy=True, health_record=health_rec)
+            board_state.publish_hub_projections(
+                board_dir,
+                result,
+                healthy=True,
+                health_record=health_rec,
+                expected_root_id=(snapshot.root_dev, snapshot.root_ino),
+            )
             _write_apfs_json(
                 runtime_dir / LAST_PUBLISHED_NAME,
                 {"snapshot_id": result["snapshot_id"], "as_of": result["as_of"]},
@@ -506,32 +564,141 @@ def run_tick(
                 candidates.append((item["first_observed_at"], item["sent_at"], item["uuid"], agent))
 
         candidates.sort()
+        if _pre_wake_hook is not None and candidates:
+            _pre_wake_hook()
         for _obs_at, _sent_at, msg_uuid, agent in candidates:
-            if wake_ledger.check_rate_limit(agent, now) is not None:
-                continue
-            # Revalidate board mount accessibility & ledger state immediately before sending
-            try:
-                binfo = Path(board_dir).lstat()
-                if stat.S_ISLNK(binfo.st_mode) or not stat.S_ISDIR(binfo.st_mode):
-                    break
-                _, rec_corrupt = wake_routes.WakeLedger.load(runtime_dir / WAKE_LEDGER_NAME, now=now)
-                if rec_corrupt:
-                    break
-            except OSError:
+            recheck_now = clock()
+            if not _verify_board_root_pinned(board_dir, snapshot.root_dev, snapshot.root_ino):
+                health_rec = dict(result["health"])
+                health_rec.update({
+                    "healthy": False,
+                    "stale": True,
+                    "live_dispatch_suppressed": True,
+                    "reason": "board_identity_changed",
+                    "as_of": board_lint.format_utc_rfc3339(recheck_now),
+                    "last_good_snapshot_id": last_pub.get("snapshot_id") if last_pub else None,
+                })
+                _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
+                emit_log(
+                    f"ts={health_rec['as_of']} route=watch status=unhealthy code=board_identity_changed duration_ms=0"
+                )
+                return {
+                    "exit_code": 2,
+                    "healthy": False,
+                    "reason": "board_identity_changed",
+                    "result": result,
+                    "wake_sent": None,
+                }
+
+            re_manifest, re_mc = board_state.load_manifest(runtime_dir / MANIFEST_NAME)
+            re_base, re_bc = _load_baseline(runtime_dir / BASELINE_NAME)
+            re_hk, _re_hk_obj, re_hkc = board_state.load_housekeeping_receipts(runtime_dir / HOUSEKEEPING_NAME)
+            re_cfg, re_rc = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
+            re_wl, re_wlc = wake_routes.WakeLedger.load(runtime_dir / WAKE_LEDGER_NAME, now=recheck_now, allow_missing=False)
+            re_ml, re_mlc = wake_routes.MailLedger.load(runtime_dir / MAIL_LEDGER_NAME, now=recheck_now)
+            re_lp, re_lpc = _read_last_published(runtime_dir / LAST_PUBLISHED_NAME)
+            if (
+                re_manifest is None
+                or re_base is None
+                or any((re_mc, re_bc, re_hkc, re_rc, re_wlc, re_mlc, re_lpc))
+            ):
+                health_rec = dict(result["health"])
+                health_rec.update({
+                    "healthy": False,
+                    "stale": True,
+                    "live_dispatch_suppressed": True,
+                    "reason": "runtime_corrupt",
+                    "as_of": board_lint.format_utc_rfc3339(recheck_now),
+                    "last_good_snapshot_id": last_pub.get("snapshot_id") if last_pub else None,
+                })
+                _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
+                emit_log(
+                    f"ts={health_rec['as_of']} route=watch status=unhealthy code=runtime_corrupt duration_ms=0"
+                )
+                return {
+                    "exit_code": 2,
+                    "healthy": False,
+                    "reason": "runtime_corrupt",
+                    "result": result,
+                    "wake_sent": None,
+                }
+
+            re_snap = board_lint.scan_board(board_dir)
+            if (
+                not re_snap.healthy
+                or (re_snap.root_dev, re_snap.root_ino) != (snapshot.root_dev, snapshot.root_ino)
+            ):
+                reason = re_snap.scan_error or "board_identity_changed"
+                if re_snap.healthy:
+                    reason = "board_identity_changed"
+                health_rec = dict(result["health"])
+                health_rec.update({
+                    "healthy": False,
+                    "stale": True,
+                    "live_dispatch_suppressed": True,
+                    "reason": reason,
+                    "as_of": board_lint.format_utc_rfc3339(recheck_now),
+                    "last_good_snapshot_id": last_pub.get("snapshot_id") if last_pub else None,
+                })
+                _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
+                emit_log(
+                    f"ts={health_rec['as_of']} route=watch status=unhealthy code={reason} duration_ms=0"
+                )
+                return {
+                    "exit_code": 2,
+                    "healthy": False,
+                    "reason": reason,
+                    "result": result,
+                    "wake_sent": None,
+                }
+
+            re_res = board_state.rebuild(
+                re_snap,
+                re_manifest,
+                recheck_now,
+                housekeeping_ids=re_hk,
+                baseline_uuids=re_base,
+                runtime_corrupt=False,
+            )
+            if re_res["health"]["live_dispatch_suppressed"]:
                 break
+            if re_res["lint"]["counts"]["high"] > result["lint"]["counts"]["high"]:
+                break
+
+            re_rcfg = re_cfg["routes"].get(agent, {"adapter": "inbox", "enabled": False})
+            if not re_rcfg.get("enabled") or re_rcfg.get("adapter") == "inbox":
+                continue
+            re_item = next(
+                (it for it in re_res["state"]["inboxes"].get(agent, []) if it["uuid"] == msg_uuid),
+                None,
+            )
+            if re_item is None or re_item["is_broadcast"] or re_item["is_baseline"]:
+                continue
+            re_thr = re_res["state"]["threads"].get(re_item["thread_id"])
+            if not re_thr or re_thr["paused"] or re_thr["frozen"] or re_thr["terminal"]:
+                continue
+            if not re_wl.is_eligible(agent, msg_uuid, recheck_now):
+                continue
+            if re_wl.check_rate_limit(agent, recheck_now) is not None:
+                continue
 
             outcome = wake_routes.wake(
                 agent,
                 msg_uuid,
                 runtime_dir=runtime_dir,
-                config=route_cfg,
+                config=re_cfg,
                 now_fn=clock,
                 agy_runner=agy_runner,
                 log_fn=emit_log,
+                require_existing_ledger=True,
             )
             wake_outcome = {"agent": agent, "uuid": msg_uuid, "outcome": outcome}
             # Refresh mail_pending.json on APFS if wake produced attention state
-            reloaded_wl, _ = wake_routes.WakeLedger.load(runtime_dir / WAKE_LEDGER_NAME, now=clock())
+            reloaded_wl, _ = wake_routes.WakeLedger.load(
+                runtime_dir / WAKE_LEDGER_NAME,
+                now=clock(),
+                allow_missing=False,
+            )
             att = reloaded_wl.attention_items()
             if att:
                 high_inc_formatted = [
@@ -607,9 +774,9 @@ def main(argv=None) -> int:
     try:
         ensure_non_root()
         board_dir, resolved_runtime_dir, _human_role = board_lint.resolve_cli_settings(args)
+        if not args.skip_apfs_check:
+            verify_apfs_residence(resolved_runtime_dir)
         runtime_dir = board_lint.verify_runtime_dir(resolved_runtime_dir, expected_mode=0o700, create=True)
-        if not args.skip_apfs_check and resolved_runtime_dir == board_lint.default_runtime_dir():
-            verify_apfs_residence(runtime_dir)
     except (WatcherError, board_lint.SecurityError, board_lint.FormatError, ValueError, OSError) as exc:
         _syslog_error(f"startup failed: {exc}")
         print(f"BoardHub startup error: {exc}", file=sys.stderr)

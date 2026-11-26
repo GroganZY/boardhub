@@ -24,7 +24,7 @@ NNNN_<from>_to_<to>--<uuid>.md
 
 1. 为每条逻辑消息生成一次 UUIDv4。
 2. 在 `<board>/` 下创建唯一的隐藏临时文件（例如 `.tmp_<uuid>_<pid>_<rand>.md`），写入并 `flush()` + `fsync()` 后关闭。
-3. 重命名为最终文件名 `NNNN_<from>_to_<to>--<uuid>.md`，并在支持目录 `fsync` 的文件系统上同步目录。
+3. 使用不覆盖语义发布为最终文件名 `NNNN_<from>_to_<to>--<uuid>.md`（`os.link()`，在不支持硬链接的文件系统上回退为 `O_CREAT|O_EXCL`），并在支持目录 `fsync` 的文件系统上同步目录。
 4. 建议使用 `board_state.py` 中的 `publish_message(...)` 辅助函数发布。
 
 ## v2 Frontmatter 格式
@@ -45,7 +45,7 @@ request_id: 7bde06b7-490a-4dd5-b981-6c7ccd091611
 thread: 7bde06b7-490a-4dd5-b981-6c7ccd091611
 prev: none
 sent_at: 2026-11-26T03:00:00Z
-needs_human: no
+needs_user: no
 assignee: dsh
 reviewer: codex
 kind: code
@@ -59,7 +59,7 @@ Implement the synthetic board replay tests.
 - `prev`：根消息填 `none`（且 `thread == request_id`）；后续消息填同一线程上一条已接受消息的 UUID。
 - `re`：可选，指向同一线程中的祖先消息 UUID（`answer` 必填，且必须指向 `question` 祖先）。
 - `sent_at`：UTC RFC 3339 时间戳（用于显示和 24 小时超时标记）。
-- `needs_human`：严格为 `yes` 或 `no`。
+- `needs_user`：严格为 `yes` 或 `no`（解析器同时兼容历史别名 `needs_grogan` 与 `needs_human`）。
 - `task`：可选的人类可读任务标签，仅允许出现在根消息。
 
 ## 消息类型与状态机规则
@@ -70,7 +70,7 @@ Implement the synthetic board replay tests.
 | `state` | `assignee` 发给 `creator`，必填 `state`。 | 允许 `open → claimed`、`claimed → in_progress`、`in_progress → blocked`、`blocked → in_progress`。 |
 | `delivery` | `assignee` 在 `in_progress` 时发给 `reviewer`（若 `reviewer: none` 则发给 `creator`）。`code` 任务必填非空 `delivers`；DSH `code` 任务必填完整 `checklist`。 | 有 `reviewer` 则进入 `in_review`，否则进入 `done`。 |
 | `review` | 固定 `reviewer` 在 `in_review` 时发给 `assignee`。必填 `review_of` 与 `verdict`（`approve` \| `revise` \| `reject`）。 | `review_of` 必须精确匹配当前交付 ID 与完整 `delivers` 哈希清单。`approve → done`、`reject → rejected`、`revise → in_progress`；第 2 次 `revise` 后自动暂停并转入人工待办。 |
-| `info`、`question`、`answer` | 常规协调。`info`/`question` 可独立开新线程；任务线程内收发方仅限任务参与者（显式 `to: <human>` 且 `needs_human: yes` 除外）。`answer` 必填 `re` 指向 `question` 祖先。 | 不改变任务状态，但同样计入 30 条上限。 |
+| `info`、`question`、`answer` | 常规协调。`info`/`question` 可独立开新线程；任务线程内收发方仅限任务参与者（显式 `to: <human>` 且 `needs_user: yes` 除外）。`answer` 必填 `re` 指向 `question` 祖先。 | 不改变任务状态，但同样计入 30 条上限。 |
 
 ### `delivers`、`review_of` 与 `checklist`
 
@@ -82,6 +82,6 @@ Implement the synthetic board replay tests.
 
 1. **分叉暂停（`THREAD_FORK`）：** 若同一已接受前驱存在多个有效后续消息，线程立即冻结在该公共前驱，两条记录均保留，生成一条人工待办项并停止该线程实时唤醒。
 2. **30 条硬上限：** 从根消息起，每条被采纳消息计数 1 次（含 `info`、`question`、`answer`）。第 30 条执行后若任务仍未终态（`done`/`rejected`），自动暂停线程并生成待办。独立线程无终态，第 30 条必暂停。第 30 条恰好达到 `done` 或 `rejected` 时保留终态结果不暂停。
-3. **人工请求（`needs_human: yes`）：** 在应用该条消息后生成待办并暂停线程（即使同条消息关闭了任务，待办仍会显示）。暂停状态独立于任务状态，已暂停或终态线程的后续消息将被拒绝（`THREAD_CLOSED`）。
+3. **人工请求（`needs_user: yes`）：** 在应用该条消息后生成待办并暂停线程（即使同条消息关闭了任务，待办仍会显示）。暂停状态独立于任务状态，已暂停或终态线程的后续消息将被拒绝（`THREAD_CLOSED`）。
 4. **授权不可通过留言板授予：** 留言板上的人工角色消息、复核通过或待办关闭均不构成执行授权。敏感操作（服务器配置、密钥、网络、测试集、训练启动、删除等）仍须人类在执行者会话中直接确认。
 5. **后续新任务：** 经人类在会话中指示后，由 `claude_main` 发起新任务线程（可用 `supersedes` 关联旧的暂停/终态任务根），原暂停记录永不篡改。

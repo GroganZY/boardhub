@@ -10,7 +10,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 HUB_DIR = Path(__file__).resolve().parent
 
@@ -42,7 +44,7 @@ def build_v2_md(
     thread_id: str,
     prev: str = "none",
     sent_at: str = "2026-11-26T03:00:00Z",
-    needs_human: str = "no",
+    needs_user: str = "no",
     extra_fields: dict = None,
     body: str = "Hello BoardHub.",
 ) -> bytes:
@@ -56,7 +58,7 @@ def build_v2_md(
         f"thread: {thread_id}",
         f"prev: {prev}",
         f"sent_at: {sent_at}",
-        f"needs_human: {needs_human}",
+        f"needs_user: {needs_user}",
     ]
     for k, v in (extra_fields or {}).items():
         lines.append(f"{k}: {v}")
@@ -89,10 +91,10 @@ class AvailabilityRecoveryWatcherTests(unittest.TestCase):
         self.clock = FakeClock(datetime(2026, 11, 26, 4, 0, 0, tzinfo=timezone.utc))
 
     def _write_msg(self, num, sender, recipient, msg_type, req_id, thread_id, prev="none",
-                   sent_at="2026-11-26T04:00:00Z", needs_human="no", extra=None, body="hi"):
+                   sent_at="2026-11-26T04:00:00Z", needs_user="no", extra=None, body="hi"):
         fname = f"{num:04d}_{sender}_to_{recipient}--{req_id}.md"
         (self.board / fname).write_bytes(
-            build_v2_md(sender, recipient, msg_type, req_id, thread_id, prev, sent_at, needs_human, extra, body)
+            build_v2_md(sender, recipient, msg_type, req_id, thread_id, prev, sent_at, needs_user, extra, body)
         )
         return fname
 
@@ -258,6 +260,196 @@ class AvailabilityRecoveryWatcherTests(unittest.TestCase):
         board_watch.run_tick(self.board, self.runtime, now_fn=self.clock, agy_runner=runner)
         self.assertEqual(len(calls), 1)
 
+    def test_pre_wake_revalidation_blocks_swap_fork_pause_and_lint(self):
+        def fresh_pair(tag):
+            sub = self.root / f"prewake_{tag}"
+            bdir = sub / "board"
+            rdir = sub / "runtime"
+            bdir.mkdir(parents=True, mode=0o700)
+            rdir.mkdir(parents=True, mode=0o700)
+            cfg = {
+                "version": 2,
+                "routes": {
+                    "gemini": {
+                        "adapter": "gemini_agy",
+                        "enabled": True,
+                        "conversation_id": "conv_gemini_01",
+                    }
+                },
+            }
+            (rdir / "routes.json").write_bytes(json.dumps(cfg).encode("utf-8"))
+            os.chmod(rdir / "routes.json", 0o600)
+            board_watch.bootstrap_runtime(bdir, rdir, as_of=self.clock())
+            return bdir, rdir
+
+        calls = []
+
+        def spy(**kw):
+            calls.append(kw)
+            return "accepted", "accepted"
+
+        # (a) Directory swap right before wake (identical contents, different inode) -> halt!
+        b_a, r_a = fresh_pair("swap")
+        self.clock.advance(20)
+        u1 = make_uuid(701)
+        fn1 = f"0001_claude_main_to_gemini--{u1}.md"
+        raw1 = build_v2_md("claude_main", "gemini", "info", u1, u1, body="msg1")
+        (b_a / fn1).write_bytes(raw1)
+        alt_board = self.root / "alt_board"
+        alt_board.mkdir(mode=0o700)
+        (alt_board / fn1).write_bytes(raw1)
+        moved_orig = self.root / "moved_orig"
+
+        def swap_before_wake():
+            b_a.rename(moved_orig)
+            alt_board.rename(b_a)
+
+        res_swap = board_watch.run_tick(
+            b_a, r_a, now_fn=self.clock, agy_runner=spy, _pre_wake_hook=swap_before_wake
+        )
+        self.assertEqual(res_swap["exit_code"], 2)
+        self.assertFalse(res_swap["healthy"])
+        self.assertEqual(res_swap["reason"], "board_identity_changed")
+        self.assertIsNone(res_swap["wake_sent"])
+        self.assertEqual(calls, [])
+
+        # (b) Competing sibling (THREAD_FORK) arrives right before wake -> skip wake!
+        b_b, r_b = fresh_pair("fork")
+        self.clock.advance(20)
+        u2_root, u2_c1, u2_c2 = make_uuid(702), make_uuid(703), make_uuid(704)
+        (b_b / f"0002_claude_main_to_gemini--{u2_root}.md").write_bytes(
+            build_v2_md("claude_main", "gemini", "info", u2_root, u2_root, body="root2")
+        )
+        board_watch.run_tick(b_b, r_b, now_fn=self.clock, allow_wake=False)
+        self.clock.advance(20)
+        (b_b / f"0003_claude_main_to_gemini--{u2_c1}.md").write_bytes(
+            build_v2_md("claude_main", "gemini", "info", u2_c1, u2_root, prev=u2_root, body="child1")
+        )
+
+        def inject_fork():
+            (b_b / f"0004_codex_to_gemini--{u2_c2}.md").write_bytes(
+                build_v2_md("codex", "gemini", "info", u2_c2, u2_root, prev=u2_root, body="competing")
+            )
+
+        res_fork = board_watch.run_tick(
+            b_b, r_b, now_fn=self.clock, agy_runner=spy, _pre_wake_hook=inject_fork
+        )
+        self.assertIsNone(res_fork["wake_sent"])
+        self.assertEqual(calls, [])
+
+        # (c) Pause (needs_user: yes) child arrives right before wake -> skip wake!
+        b_c, r_c = fresh_pair("pause")
+        self.clock.advance(20)
+        u3_root, u3_c, u3_pause = make_uuid(705), make_uuid(706), make_uuid(707)
+        (b_c / f"0005_claude_main_to_gemini--{u3_root}.md").write_bytes(
+            build_v2_md("claude_main", "gemini", "info", u3_root, u3_root, body="root3")
+        )
+        board_watch.run_tick(b_c, r_c, now_fn=self.clock, allow_wake=False)
+        self.clock.advance(20)
+        (b_c / f"0006_claude_main_to_gemini--{u3_c}.md").write_bytes(
+            build_v2_md("claude_main", "gemini", "info", u3_c, u3_root, prev=u3_root, body="eligible")
+        )
+
+        def inject_pause():
+            (b_c / f"0007_gemini_to_owner--{u3_pause}.md").write_bytes(
+                build_v2_md("gemini", "owner", "question", u3_pause, u3_root, prev=u3_c, needs_user="yes", body="pause")
+            )
+
+        res_pause = board_watch.run_tick(
+            b_c, r_c, now_fn=self.clock, agy_runner=spy, _pre_wake_hook=inject_pause
+        )
+        self.assertIsNone(res_pause["wake_sent"])
+        self.assertEqual(calls, [])
+
+        # (d) Tampering (IMMUTABILITY high lint) right before wake -> skip wake!
+        b_d, r_d = fresh_pair("lint")
+        self.clock.advance(20)
+        u4 = make_uuid(708)
+        fn4 = f"0008_claude_main_to_gemini--{u4}.md"
+        (b_d / fn4).write_bytes(
+            build_v2_md("claude_main", "gemini", "info", u4, u4, body="original4")
+        )
+
+        def inject_tamper():
+            (b_d / fn4).write_bytes(build_v2_md("claude_main", "gemini", "info", u4, u4, body="tampered4"))
+
+        res_lint = board_watch.run_tick(
+            b_d, r_d, now_fn=self.clock, agy_runner=spy, _pre_wake_hook=inject_tamper
+        )
+        self.assertIsNone(res_lint["wake_sent"])
+        self.assertEqual(calls, [])
+
+    def test_missing_initialized_wake_ledger_stops_sending_everywhere(self):
+        self._enable_gemini_route()
+        board_watch.bootstrap_runtime(self.board, self.runtime, as_of=self.clock())
+        calls = []
+
+        def spy(**kw):
+            calls.append(kw)
+            return "accepted", "accepted"
+
+        # 1. Missing wake_ledger.json at tick start -> runtime_corrupt, never recreated
+        self.clock.advance(20)
+        u1 = make_uuid(720)
+        self._write_msg(1, "claude_main", "gemini", "info", u1, u1, body="should not send")
+        (self.runtime / "wake_ledger.json").unlink()
+
+        res1 = board_watch.run_tick(self.board, self.runtime, now_fn=self.clock, agy_runner=spy)
+        self.assertEqual(res1["exit_code"], 2)
+        self.assertFalse(res1["healthy"])
+        self.assertEqual(res1["reason"], "runtime_corrupt")
+        self.assertIsNone(res1["wake_sent"])
+        self.assertEqual(calls, [])
+        self.assertFalse((self.runtime / "wake_ledger.json").exists())
+
+        # Direct wake_routes.wake() on initialized runtime with missing ledger also refuses
+        direct_out = wake_routes.wake(
+            "gemini", u1, runtime_dir=self.runtime, now_fn=self.clock, agy_runner=spy
+        )
+        self.assertEqual(direct_out, "not_sent")
+        self.assertEqual(calls, [])
+        self.assertFalse((self.runtime / "wake_ledger.json").exists())
+
+        # 2. Missing wake_ledger.json right before send (deleted during _pre_wake_hook) -> halts!
+        rt2 = self.root / "rt2"
+        rt2.mkdir(mode=0o700)
+        cfg = json.loads((self.runtime / "routes.json").read_text(encoding="utf-8"))
+        (rt2 / "routes.json").write_bytes(json.dumps(cfg).encode("utf-8"))
+        os.chmod(rt2 / "routes.json", 0o600)
+        board_watch.bootstrap_runtime(self.board, rt2, as_of=self.clock())
+        self.clock.advance(20)
+        u2 = make_uuid(721)
+        self._write_msg(2, "claude_main", "gemini", "info", u2, u2, body="prewake missing")
+
+        res2 = board_watch.run_tick(
+            self.board, rt2, now_fn=self.clock, agy_runner=spy,
+            _pre_wake_hook=lambda: (rt2 / "wake_ledger.json").unlink(),
+        )
+        self.assertEqual(res2["exit_code"], 2)
+        self.assertEqual(res2["reason"], "runtime_corrupt")
+        self.assertIsNone(res2["wake_sent"])
+        self.assertEqual(calls, [])
+        self.assertFalse((rt2 / "wake_ledger.json").exists())
+
+    def test_custom_runtime_dir_runs_apfs_check_unless_skipped(self):
+        custom_rt = self.root / "custom_rt"
+        with mock.patch.object(
+            board_watch,
+            "verify_apfs_residence",
+            side_effect=board_watch.WatcherError("Runtime directory must reside on APFS."),
+        ) as apfs_check:
+            rc = board_watch.main(["--board", str(self.board), "--runtime-dir", str(custom_rt), "--bootstrap"])
+        self.assertEqual(rc, 2)
+        apfs_check.assert_called_once_with(custom_rt)
+        self.assertFalse(custom_rt.exists())
+
+        with mock.patch.object(board_watch, "verify_apfs_residence") as apfs_skip:
+            rc_skip = board_watch.main([
+                "--board", str(self.board), "--runtime-dir", str(custom_rt), "--bootstrap", "--skip-apfs-check",
+            ])
+        self.assertEqual(rc_skip, 0)
+        apfs_skip.assert_not_called()
+
 
 class WakeAndMailTests(unittest.TestCase):
     def setUp(self):
@@ -414,7 +606,7 @@ class WakeAndMailTests(unittest.TestCase):
                 )
                 (bdir / f"0002_gemini_to_owner--{u_esc}.md").write_bytes(
                     build_v2_md("gemini", "owner", "question", u_esc, u_task, prev=u_task,
-                                needs_human="yes", body=body_text)
+                                needs_user="yes", body=body_text)
                 )
                 snap = board_lint.scan_board(bdir)
                 res = board_state.rebuild(snap, {}, self.clock())
@@ -441,13 +633,13 @@ class WakeAndMailTests(unittest.TestCase):
         os.chmod(self.runtime / "routes.json", 0o600)
         board_watch.bootstrap_runtime(self.board, self.runtime, as_of=self.clock())
 
-        # Post broadcast to 'all' and a paused message (needs_human: yes)
+        # Post broadcast to 'all' and a paused message (needs_user: yes)
         u_all, u_paused = make_uuid(600), make_uuid(601)
         (self.board / f"0001_claude_main_to_all--{u_all}.md").write_bytes(
             build_v2_md("claude_main", "all", "info", u_all, u_all, body="broadcast")
         )
         (self.board / f"0002_claude_main_to_gemini--{u_paused}.md").write_bytes(
-            build_v2_md("claude_main", "gemini", "question", u_paused, u_paused, needs_human="yes", body="paused")
+            build_v2_md("claude_main", "gemini", "question", u_paused, u_paused, needs_user="yes", body="paused")
         )
         calls = []
 
@@ -475,6 +667,35 @@ class WakeAndMailTests(unittest.TestCase):
         sub_ok = ml_reloaded.begin_submission([res["result"]["mail_pending"]["items"][0]["item_id"]], res["result"]["snapshot_id"], now=self.clock())
         ml_reloaded.finish_submission(sub_ok, "sent", now=self.clock())
         self.assertEqual(len(res["result"]["state"]["pending"]), 1)
+
+    def test_post_send_error_is_uncertain_never_retries_and_streaming_cap(self):
+        # 1. Post-send error (broker_io_error / broker_timeout) -> uncertain, never auto-retries
+        for idx, code in enumerate(("broker_io_error", "broker_timeout"), start=1):
+            uid = make_uuid(800 + idx)
+            c_err = self._write_fake_agy_client(
+                f'import sys, json; print(json.dumps({{"ok": False, "error": {{"code": "{code}", "message": "post-send"}}}})); sys.exit(1)\n'
+            )
+            self.clock.advance(70)
+            out = wake_routes.wake("gemini", uid, runtime_dir=self.runtime, config=self._cfg(c_err), now_fn=self.clock)
+            self.assertEqual(out, "uncertain")
+            wl, _ = wake_routes.WakeLedger.load(self.runtime / "wake_ledger.json", now=self.clock())
+            rec = wl.get_record("gemini", uid)
+            self.assertFalse(rec["transient_retryable"])
+            self.assertTrue(rec["operator_action_required"])
+            self.assertFalse(wl.is_eligible("gemini", uid, self.clock() + timedelta(seconds=120)))
+
+        # 2. Streaming output cap terminates runaway child immediately before outer timeout
+        c_flood = self._write_fake_agy_client(
+            'import sys, time\nsys.stdout.write("x" * (300 * 1024))\nsys.stdout.flush()\ntime.sleep(10)\n'
+        )
+        t0 = time.monotonic()
+        outcome, rcode = wake_routes.run_agy_client_send(
+            "conv_123", wake_routes.build_wake_prompt(make_uuid(810)),
+            agy_client_path=str(c_flood), python_bin=sys.executable, timeout=5.0,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual((outcome, rcode), ("uncertain", "output_limit_exceeded"))
+        self.assertLess(elapsed, 2.5)
 
 
 if __name__ == "__main__":

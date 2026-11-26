@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic unittest suite for board_lint and board_state (Area 1-4)."""
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 import random
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 HUB_DIR = Path(__file__).resolve().parent
@@ -44,7 +46,7 @@ def build_v2_md(
     thread_id: str,
     prev: str = "none",
     sent_at: str = "2026-11-26T03:00:00Z",
-    needs_human: str = "no",
+    needs_user: str = "no",
     extra_fields: dict = None,
     body: str = "Synthetic message body.",
 ) -> bytes:
@@ -58,7 +60,7 @@ def build_v2_md(
         f"thread: {thread_id}",
         f"prev: {prev}",
         f"sent_at: {sent_at}",
-        f"needs_human: {needs_human}",
+        f"needs_user: {needs_user}",
     ]
     for k, v in (extra_fields or {}).items():
         lines.append(f"{k}: {v}")
@@ -170,8 +172,8 @@ class PublicationAndParsingTests(unittest.TestCase):
         u2 = make_uuid(31)
         dup_fm = (
             f"---\nv: 2\nfrom: claude_main\nto: dsh\ntype: info\nrequest_id: {u2}\n"
-            f"thread: {u2}\nprev: none\nsent_at: 2026-11-26T03:00:00Z\nneeds_human: no\n"
-            f"needs_human: no\n---\n\nbody\n"
+            f"thread: {u2}\nprev: none\nsent_at: 2026-11-26T03:00:00Z\nneeds_user: no\n"
+            f"needs_user: no\n---\n\nbody\n"
         ).encode("utf-8")
         (self.board / f"0002_claude_main_to_dsh--{u2}.md").write_bytes(dup_fm)
         # Duplicate JSON key and NaN inside delivers/review_of
@@ -183,7 +185,7 @@ class PublicationAndParsingTests(unittest.TestCase):
         )
         dup_json = (
             f"---\nv: 2\nfrom: dsh\nto: codex\ntype: delivery\nrequest_id: {u3}\n"
-            f"thread: {u_root}\nprev: {u_root}\nsent_at: 2026-11-26T03:01:00Z\nneeds_human: no\n"
+            f"thread: {u_root}\nprev: {u_root}\nsent_at: 2026-11-26T03:01:00Z\nneeds_user: no\n"
             'delivers: {"a.py":"' + ("0" * 64) + '","a.py":"' + ("1" * 64) + '"}\n'
             f'checklist: {json.dumps(full_checklist())}\n---\n\nbody\n'
         ).encode("utf-8")
@@ -252,11 +254,11 @@ class ReplayTasksPausesTests(unittest.TestCase):
 
     def _write_v2(self, num: int, sender: str, recipient: str, msg_type: str,
                   req_id: str, thread_id: str, prev: str = "none",
-                  sent_at: str = "2026-11-26T03:00:00Z", needs_human: str = "no",
+                  sent_at: str = "2026-11-26T03:00:00Z", needs_user: str = "no",
                   extra: dict = None, body: str = "body"):
         fname = f"{num:04d}_{sender}_to_{recipient}--{req_id}.md"
         raw = build_v2_md(sender, recipient, msg_type, req_id, thread_id, prev,
-                          sent_at=sent_at, needs_human=needs_human, extra_fields=extra, body=body)
+                          sent_at=sent_at, needs_user=needs_user, extra_fields=extra, body=body)
         (self.board / fname).write_bytes(raw)
         return fname
 
@@ -494,14 +496,14 @@ class ReplayTasksPausesTests(unittest.TestCase):
         self._write_v2(130, "claude_main", "codex", "review", ub30, u_b, prev=ub29,
                        extra={"review_of": json.dumps({"id": ub29, "delivers": {}}), "verdict": "approve"})
 
-        # Task C: closes task AND sets needs_human: yes on same event -> done AND pending opens!
+        # Task C: closes task AND sets needs_user: yes on same event -> done AND pending opens!
         u_c = make_uuid(700)
         uc1, uc2, uc3 = make_uuid(701), make_uuid(702), make_uuid(703)
         self._write_v2(201, "claude_main", "codex", "task", u_c, u_c,
                        extra={"assignee": "codex", "reviewer": "none", "kind": "coordination"})
         self._write_v2(202, "codex", "claude_main", "state", uc1, u_c, prev=u_c, extra={"state": "claimed"})
         self._write_v2(203, "codex", "claude_main", "state", uc2, u_c, prev=uc1, extra={"state": "in_progress"})
-        self._write_v2(204, "codex", "claude_main", "delivery", uc3, u_c, prev=uc2, needs_human="yes")
+        self._write_v2(204, "codex", "claude_main", "delivery", uc3, u_c, prev=uc2, needs_user="yes")
 
         # Task D: second revise pauses after recording verdict
         u_d = make_uuid(800)
@@ -531,7 +533,7 @@ class ReplayTasksPausesTests(unittest.TestCase):
         # Task C
         self.assertEqual(res["state"]["tasks"][u_c]["state"], "done")
         self.assertTrue(res["state"]["threads"][u_c]["paused"])
-        self.assertEqual(res["state"]["threads"][u_c]["pause_reason"], "needs_human")
+        self.assertEqual(res["state"]["threads"][u_c]["pause_reason"], "needs_user")
         # Task D
         self.assertEqual(res["state"]["tasks"][u_d]["state"], "in_progress")
         self.assertEqual(res["state"]["tasks"][u_d]["revise_count"], 2)
@@ -585,11 +587,106 @@ class ReplayTasksPausesTests(unittest.TestCase):
         u_ask = make_uuid(951)
         self._write_v2(1, "claude_main", "codex", "task", u_task, u_task,
                        extra={"assignee": "codex", "reviewer": "none", "kind": "coordination"})
-        self._write_v2(2, "codex", "maintainer", "question", u_ask, u_task, prev=u_task, needs_human="yes")
+        self._write_v2(2, "codex", "maintainer", "question", u_ask, u_task, prev=u_task, needs_user="yes")
         res = board_state.rebuild(board_lint.scan_board(self.board), {}, self.as_of)
         self.assertEqual(res["lint"]["exit_code"], 0)
         self.assertEqual(len(res["state"]["inboxes"]["maintainer"]), 1)
         self.assertTrue(res["state"]["threads"][u_task]["paused"])
+
+    def test_scan_pins_board_root_device_and_inode_across_passes(self):
+        u1 = make_uuid(960)
+        b1 = build_v2_md("claude_main", "dsh", "info", u1, u1, body="identical bytes")
+        fname = f"0001_claude_main_to_dsh--{u1}.md"
+        (self.board / fname).write_bytes(b1)
+
+        alt_board = Path(self.tmp.name) / "alt_board"
+        alt_board.mkdir()
+        (alt_board / fname).write_bytes(b1)
+        old_board = Path(self.tmp.name) / "old_board"
+
+        def swap_identical_dir():
+            self.board.rename(old_board)
+            alt_board.rename(self.board)
+
+        snap = board_lint.scan_board(self.board, _second_pass_hook=swap_identical_dir)
+        self.assertFalse(snap.healthy)
+        self.assertEqual(snap.scan_error, "board_identity_changed")
+
+    def test_publish_message_never_overwrites_via_link_or_o_excl(self):
+        u1 = make_uuid(970)
+        b_first = build_v2_md("claude_main", "dsh", "info", u1, u1, body="First writer")
+        b_second = build_v2_md("claude_main", "dsh", "info", u1, u1, body="Second writer")
+        final_path = self.board / f"0001_claude_main_to_dsh--{u1}.md"
+
+        def inject_competing_final():
+            final_path.write_bytes(b_first)
+
+        # Even if final_path appears after existing_now check, os.link() refuses to overwrite
+        with self.assertRaises(board_state.RequestConflictError):
+            board_state.publish_message(
+                self.board, 1, "claude_main", "dsh", u1, b_second,
+                _before_publish_hook=inject_competing_final,
+            )
+        self.assertEqual(final_path.read_bytes(), b_first)
+        orig_ino = final_path.stat().st_ino
+
+        # Identical second writer succeeds idempotently without replacing inode
+        res_dup = board_state.publish_message(
+            self.board, 1, "claude_main", "dsh", u1, b_first,
+            _before_publish_hook=lambda: None,
+        )
+        self.assertEqual(res_dup["status"], "idempotent_ok")
+        self.assertEqual(final_path.stat().st_ino, orig_ino)
+
+        # Simulate filesystem without hard links (e.g., exFAT ENOTSUP) -> O_CREAT|O_EXCL fallback
+        u2 = make_uuid(971)
+        b2_first = build_v2_md("claude_main", "dsh", "info", u2, u2, body="exFAT first")
+        b2_second = build_v2_md("claude_main", "dsh", "info", u2, u2, body="exFAT second")
+        final2 = self.board / f"0002_claude_main_to_dsh--{u2}.md"
+        with mock.patch.object(board_state.os, "link", side_effect=OSError(errno.ENOTSUP, "not supported")):
+            res2 = board_state.publish_message(self.board, 2, "claude_main", "dsh", u2, b2_first)
+            self.assertEqual(res2["status"], "published")
+            with self.assertRaises(board_state.RequestConflictError):
+                board_state.publish_message(
+                    self.board, 2, "claude_main", "dsh", u2, b2_second,
+                    _before_publish_hook=lambda: None,
+                )
+            self.assertEqual(final2.read_bytes(), b2_first)
+
+    def test_needs_user_canonical_and_legacy_aliases_compat(self):
+        self.addCleanup(board_lint.configure_human_role, board_lint.DEFAULT_HUMAN_ROLE)
+        board_lint.configure_human_role("grogan")
+        for idx, field_name in enumerate(("needs_user", "needs_grogan", "needs_human"), start=1):
+            uid = make_uuid(980 + idx)
+            raw = (
+                "---\nv: 2\nfrom: claude_main\nto: grogan\ntype: info\n"
+                f"request_id: {uid}\nthread: {uid}\nprev: none\n"
+                f"sent_at: 2026-11-26T03:00:00Z\n{field_name}: yes\n---\n\nping\n"
+            ).encode("utf-8")
+            (self.board / f"{idx:04d}_claude_main_to_grogan--{uid}.md").write_bytes(raw)
+
+        # Conflicting/duplicate needs_* keys and missing needs_* key must fail FORMAT
+        u_dup = make_uuid(988)
+        (self.board / f"0004_claude_main_to_dsh--{u_dup}.md").write_bytes((
+            "---\nv: 2\nfrom: claude_main\nto: dsh\ntype: info\n"
+            f"request_id: {u_dup}\nthread: {u_dup}\nprev: none\n"
+            "sent_at: 2026-11-26T03:00:00Z\nneeds_user: yes\nneeds_grogan: no\n---\n\nbad\n"
+        ).encode("utf-8"))
+        u_miss = make_uuid(989)
+        (self.board / f"0005_claude_main_to_dsh--{u_miss}.md").write_bytes((
+            "---\nv: 2\nfrom: claude_main\nto: dsh\ntype: info\n"
+            f"request_id: {u_miss}\nthread: {u_miss}\nprev: none\n"
+            "sent_at: 2026-11-26T03:00:00Z\n---\n\nmissing\n"
+        ).encode("utf-8"))
+
+        res = board_state.rebuild(board_lint.scan_board(self.board), {}, self.as_of)
+        for idx in (1, 2, 3):
+            uid = make_uuid(980 + idx)
+            self.assertTrue(res["state"]["threads"][uid]["paused"])
+            self.assertEqual(res["state"]["threads"][uid]["pause_reason"], "needs_user")
+        by_file = {d["file"]: d["code"] for d in res["lint"]["diagnostics"]}
+        self.assertEqual(by_file[f"0004_claude_main_to_dsh--{u_dup}.md"], "FORMAT")
+        self.assertEqual(by_file[f"0005_claude_main_to_dsh--{u_miss}.md"], "FORMAT")
 
 
 if __name__ == "__main__":
