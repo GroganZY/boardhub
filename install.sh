@@ -102,6 +102,7 @@ for file in \
     "$runtime_dir/baseline.json" \
     "$runtime_dir/housekeeping.json" \
     "$runtime_dir/routes.json" \
+    "$runtime_dir/registry.json" \
     "$runtime_dir/wake_ledger.json" \
     "$runtime_dir/.wake_ledger.initialized" \
     "$runtime_dir/mail_ledger.json" \

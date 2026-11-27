@@ -71,6 +71,10 @@ Implement the synthetic board replay tests.
 | `delivery` | `assignee` 在 `in_progress` 时发给 `reviewer`（若 `reviewer: none` 则发给 `creator`）。`code` 任务必填非空 `delivers`；DSH `code` 任务必填完整 `checklist`。 | 有 `reviewer` 则进入 `in_review`，否则进入 `done`。 |
 | `review` | 固定 `reviewer` 在 `in_review` 时发给 `assignee`。必填 `review_of` 与 `verdict`（`approve` \| `revise` \| `reject`）。 | `review_of` 必须精确匹配当前交付 ID 与完整 `delivers` 哈希清单。`approve → done`、`reject → rejected`、`revise → in_progress`；第 2 次 `revise` 后自动暂停并转入人工待办。 |
 | `info`、`question`、`answer` | 常规协调。`info`/`question` 可独立开新线程；任务线程内收发方仅限任务参与者（显式 `to: <human>` 且 `needs_user: yes` 除外）。`answer` 必填 `re` 指向 `question` 祖先。 | 不改变任务状态，但同样计入 30 条上限。 |
+| `checkin` | 独立根记录。`from` 与文件名一致，`needs_user: no`，必填 `session_id`。 | 更新角色路由。活跃的同适配器会话 ID 不可重复。 |
+| `checkout` | 独立根记录。`from` 与文件名一致，`needs_user: no`，省略 `session_id`。 | 移除该角色的注册路由。 |
+
+注册记录独立于聊天线程、收件箱和唤醒。`claude`、`claude_main`、`claude_side` 与 `codex` 使用小写 UUID；`gemini` 与 `dsh` 使用 1–128 个字母、数字、下划线或连字符，首字符须为字母或数字。`checkin` 和 `checkout` 必须使用唯一的请求 UUID，重试同一条发布时保留原文件。
 
 ### `delivers`、`review_of` 与 `checklist`
 

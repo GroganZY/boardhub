@@ -336,6 +336,7 @@ def rebuild(
             "mail_pending": None,
             "legacy_messages": [],
             "v2_records": [],
+            "registry_events": {},
         }
 
     # --- 1. Unsafe entries & Immutability checks BEFORE parsing changed files ---
@@ -508,7 +509,9 @@ def rebuild(
         else:
             identical = False
 
-        if all_parsed and identical:
+        # Registration requests have unique IDs. Retrying the very same publication
+        # remains idempotent, but two board files may not register the same request.
+        if all_parsed and identical and group[0][1].msg_type not in board_lint.REGISTRY_EVENT_TYPES:
             primary = group[0][1]
             valid_by_uuid[msg_uuid] = primary
             for _entry, alias_msg, _diags in group[1:]:
@@ -581,6 +584,8 @@ def rebuild(
 
     for msg_uuid in sorted(valid_by_uuid):
         msg = valid_by_uuid[msg_uuid]
+        if msg.msg_type in board_lint.REGISTRY_EVENT_TYPES:
+            continue
         if msg.prev == "none":
             roots[msg_uuid] = msg
         else:
@@ -673,6 +678,35 @@ def rebuild(
             )
         )
         _record_v2_view(msg, "rejected", code)
+
+    # Replay standalone role records independently of conversation threads.
+    # Session IDs travel only to the private runtime, never into projections.
+    registry_events: Dict[str, dict] = {}
+    active_sessions: Set[Tuple[str, str]] = set()
+    role_events = sorted(
+        (m for m in valid_by_uuid.values() if m.msg_type in board_lint.REGISTRY_EVENT_TYPES),
+        key=lambda m: (m.sent_at_dt, m.number, m.filename),
+    )
+    for msg in role_events:
+        if msg.thread in frozen_threads:
+            continue
+        adapter = board_lint.ROLE_ADAPTERS[msg.sender]
+        if msg.session_id is not None and (adapter, msg.session_id) in active_sessions:
+            _reject_msg(msg, "DUPLICATE_SESSION_ID")
+            continue
+        previous = registry_events.get(msg.sender)
+        if previous is not None and previous["session_id"] is not None:
+            active_sessions.remove((adapter, previous["session_id"]))
+        if msg.session_id is not None:
+            active_sessions.add((adapter, msg.session_id))
+        registry_events[msg.sender] = {
+            "event_id": msg.request_id,
+            "session_id": msg.session_id,
+            "sent_at": msg.sent_at,
+            "filename": msg.filename,
+        }
+        accepted_uuids.add(msg.request_id)
+        _record_v2_view(msg, "accepted")
 
     # First handle supersedes cycle roots
     for rid in sorted(supersedes_cycle_roots):
@@ -1127,7 +1161,7 @@ def rebuild(
         "health": health,
         "counts": {
             "legacy_messages": len(legacy_messages),
-            "v2_accepted": len(accepted_events_list),
+            "v2_accepted": len(accepted_uuids),
             "v2_rejected": len(rejected_uuids),
             "tasks": len(tasks_out),
             "threads": len(threads_out),
@@ -1155,6 +1189,7 @@ def rebuild(
         "mail_pending": mail_digest,
         "legacy_messages": legacy_messages,
         "v2_records": v2_records_view,
+        "registry_events": registry_events,
     }
 
 

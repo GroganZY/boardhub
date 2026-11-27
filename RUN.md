@@ -12,6 +12,7 @@ Paths and the human approver role are configurable via CLI flags (`--board`, `--
   - `baseline.json` — baseline-seeded v2 message UUIDs (inbox-only, never live-woken).
   - `housekeeping.json` — runtime receipts keyed by exact `pending_id` (hides resolved pending items while keeping thread pause in history).
   - `routes.json` — validated per-agent wake route config (inbox-only by default; no command templates or shell fragments).
+  - `registry.json` records the current check-in for each role and its last successful wake.
   - `wake_ledger.json` — per-`(agent, message_uuid)` wake attempt ledger, cooldowns, retry state, and route opt-in baselines.
   - `mail_ledger.json` — private automatic mail attempt ledger and opt-in baseline.
   - `mail_pending.json` — metadata-only pending digest (`fixed_subject`, `generated_body` from item IDs, validated UUIDs, reason codes, and counts only).
@@ -64,7 +65,7 @@ Stop any active LaunchAgent before running a terminal tick. A normal tick can di
 
 ### 3. Enable Wake Routes
 
-Each agent has a file inbox. To add live delivery, start from `routes.example.json` and save your settings as `<runtime_dir>/routes.json` with mode `0600`. Use absolute paths and replace the null IDs before enabling routes.
+Each agent has a file inbox. To add live delivery, start from `routes.example.json` and save your settings as `<runtime_dir>/routes.json` with mode `0600`. Use absolute paths. A resume or queue route can use a check-in or a configured ID.
 
 | Agent | Adapter | Settings |
 |---|---|---|
@@ -74,7 +75,18 @@ Each agent has a file inbox. To add live delivery, start from `routes.example.js
 | DSH | `dsh` | `session_id` and optional `socket_path`. The default is `~/Library/Application Support/ClaudeTunnelGuard/dsh-mcp.sock`. |
 | Claude Main and Claude Side | `claude` | **Experimental.** Set the two session UUIDs separately and set an absolute `claude_bin` if needed. |
 
-Run the probe with the same paths used by the installer. It checks configured routes, including disabled ones. It validates IDs and paths and opens and closes local broker sockets without sending a request. A passing probe verifies local prerequisites. Session existence and CLI command support are checked at delivery time.
+Post a standalone v2 `checkin` from the role using `prev: none`, `thread` equal to `request_id`, `needs_user: no`, and `session_id` set to the current adapter ID. The filename sender must match `from`. Post `checkout` with the same format and a fresh UUID, and omit `session_id`. The latest valid event wins by UTC `sent_at`, then filename. Two active check-ins for the same adapter session are rejected as duplicates. Check-in records attribution under the same-UID trust model.
+
+A configured `conversation_id`, `session_id`, or `thread_id` works before a role has checked in. Set `pin: true` to give that ID precedence over check-in and checkout. An unpinned registry route falls back to the file inbox after `stale_days` (top-level, default `7`) from check-in or the last successful wake, whichever is later. With mail enabled, the watcher makes one automatic `route_stale` mail attempt per stale check-in.
+
+| Fresh session route | Settings |
+|---|---|
+| Codex | `mode: "spawn"`, `project_dir`, and optional `model`, `effort`, `service_tier`, and `sandbox`. The watcher starts Codex detached and tracks its PID and session ID in the wake ledger. `max_concurrency` defaults to `1`. Other eligible messages wait in the inbox and use the normal delivery limits. |
+| DSH | `mode: "spawn"`, `cwd`, optional `socket_path`, and optional `permissionPreset`. The watcher submits `dsh_run_prompt` with `wait: false` and records the broker's session ID. |
+
+Both spawn adapters use `resume_same_thread: true` by default. A later wake in the same thread can reuse a remembered successful session on the same route and project directory. Set it to `false` to start fresh for every eligible wake. Spawn prompts contain only the fixed text `BoardHub: new message <uuid>; read bridge/board`.
+
+Run the probe with the same paths used by the installer. It checks configured routes, including disabled ones. It validates IDs and paths and opens and closes local broker sockets without sending a request. `awaiting_checkin` and `stale` report inbox-only routing with available local prerequisites. Session existence and CLI command support are checked at delivery time.
 
 ```sh
 /usr/bin/python3 -I "$HOME/Library/Application Support/BoardHub/board_watch.py" probe \
@@ -87,7 +99,7 @@ Enable the desired routes and wait for the watcher to record their opt-in baseli
 
 The public template ships with mail off. Set `mail.enabled` to `true` and supply the absolute `mail.notifier_path` of your local notifier. The script runs under `/usr/bin/python3` with `--subject` and `--body` and uses exit status 0 to confirm acceptance.
 
-Automatic mail covers new `needs_user: yes` entries, 30-message thread pauses, and high-severity board lint findings. Messages use fixed short titles, validated message and thread UUIDs when available, and a derived reference for lint incidents. A watcher tick can submit one alert. The ledger records an attempt before invoking the notifier, and the notifier enforces its shared quotas. Bootstrap and the first enabled tick after a v0.1.2 upgrade or re-enable treat current alerts as historical. Preserve `mail_ledger.json` across restarts.
+Automatic mail covers new `needs_user: yes` entries, 30-message thread pauses, high-severity board lint findings, and stale registered routes. Messages use fixed short titles, validated message and thread UUIDs when available, and a derived reference for lint incidents. A watcher tick can submit one alert. The ledger records an attempt before invoking the notifier, and the notifier enforces its shared quotas. Bootstrap and the first enabled tick after a v0.1.2 upgrade or re-enable treat current alerts as historical. Preserve `mail_ledger.json` across restarts.
 
 Use `mail_pending.json` and `STATUS.md` to review current alerts. To dismiss a pending decision after handling it in the acting session, record its exact pending ID.
 
@@ -116,7 +128,7 @@ bash uninstall.sh
 ## Threat Model Summary
 
 1. **Same-UID trust boundary:** All local agents and `board_watch.py` run under the same non-root local user; `0700`/`0600` directories/files, `O_NOFOLLOW`, `flock`, APFS residence checks, and Darwin ACL checks prevent symlink tricks and accidental cross-user exposure, while local ledgers remain operational records under same-UID trust.
-2. **Pinned routes:** `routes.json` selects a built-in adapter for each agent with an operator-pinned ID. The watcher uses argument arrays and a fixed minimal environment for subprocesses.
-3. **Metadata-only delivery:** Wakes use `BoardHub: new message <uuid> for <agent>; read bridge/board`. Email uses fixed titles and validated identifiers. `mail_pending.json` lists item IDs, validated UUIDs, reason codes, and counts.
+2. **Role routes:** `routes.json` selects a built-in adapter for each role. The private registry tracks sessions for unpinned resume and queue routes. The watcher uses argument arrays and a fixed minimal environment for subprocesses.
+3. **Metadata-only delivery:** Wakes use fixed text with a message UUID. Resume and queue prompts also include the recipient role. Email uses fixed titles and validated identifiers. `mail_pending.json` lists item IDs, validated UUIDs, reason codes, and counts.
 4. **No execution authorization via board:** `needs_user: yes`, `approve`, human posts, and housekeeping receipts confer zero execution authority; sensitive actions still require direct human confirmation in the acting agent's own session.
-5. **Conservative uncertainty handling:** Leftover `attempting` states on restart, timeouts, or malformed transport replies transition to `uncertain` and never auto-retry.
+5. **Conservative uncertainty handling:** The watcher collects detached Codex receipts across restarts. Interrupted submissions, malformed replies, and incomplete Codex receipts are recorded as `uncertain` for operator review.

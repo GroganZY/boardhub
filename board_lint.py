@@ -159,7 +159,25 @@ def resolve_cli_settings(args) -> Tuple[Path, Path, str]:
 
     return board_dir, runtime_dir, human_role
 
-V2_TYPES = frozenset({
+ROLE_ADAPTERS = {
+    "gemini": "gemini_agy",
+    "codex": "codex",
+    "dsh": "dsh",
+    "claude": "claude",
+    "claude_main": "claude",
+    "claude_side": "claude",
+}
+REGISTRY_EVENT_TYPES = frozenset({"checkin", "checkout"})
+SESSION_UUID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+CONVERSATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+SESSION_ID_PATTERNS = {
+    "codex": SESSION_UUID_RE,
+    "claude": SESSION_UUID_RE,
+    "gemini_agy": CONVERSATION_ID_RE,
+    "dsh": CONVERSATION_ID_RE,
+}
+
+V2_TYPES = REGISTRY_EVENT_TYPES | frozenset({
     "task",
     "state",
     "delivery",
@@ -206,6 +224,7 @@ KNOWN_V2_FIELDS = frozenset(COMMON_V2_REQUIRED) | frozenset(NEEDS_USER_FIELDS) |
     "review_of",
     "verdict",
     "checklist",
+    "session_id",
 })
 
 MAX_V2_FILE_BYTES = 64 * 1024
@@ -608,6 +627,7 @@ def escape_safe_text(value: str) -> str:
 # --- Diagnostic and record data structures ---
 
 FIXED_DIAGNOSTIC_MESSAGES = {
+    "DUPLICATE_SESSION_ID": "The adapter session already has an active check-in.",
     "IMMUTABILITY": "Manifest entry missing or modified after healthy scan.",
     "UNSAFE_ENTRY": "Message-shaped entry is a symlink or non-regular file.",
     "REQUEST_CONFLICT": "Duplicate v2 message UUID with differing bytes or route.",
@@ -708,6 +728,7 @@ class ParsedV2Message:
     verdict: Optional[str]
     checklist: Optional[Dict[str, dict]]
     body: str
+    session_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1038,6 +1059,8 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
         "info": {"task", "re"},
         "question": {"task", "re"},
         "answer": {"re"},
+        "checkin": {"session_id"},
+        "checkout": set(),
     }[msg_type]
     extra_keys = set(meta.keys()) - set(COMMON_V2_REQUIRED) - set(NEEDS_USER_FIELDS) - allowed_type_fields
     if extra_keys:
@@ -1051,6 +1074,17 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
     review_of: Optional[dict] = None
     verdict: Optional[str] = None
     checklist: Optional[Dict[str, dict]] = None
+
+    session_id = meta.get("session_id")
+    if msg_type in REGISTRY_EVENT_TYPES:
+        if sender not in ROLE_ADAPTERS:
+            return None, [_v2_fail("ROLE", filename, req_id, thread)]
+        if not is_root or needs_user:
+            return None, [_v2_fail("FORMAT", filename, req_id, thread)]
+        if msg_type == "checkin" and (
+            session_id is None or not SESSION_ID_PATTERNS[ROLE_ADAPTERS[sender]].fullmatch(session_id)
+        ):
+            return None, [_v2_fail("FORMAT", filename, req_id, thread)]
 
     if msg_type == "task":
         if not is_root:
@@ -1164,6 +1198,7 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
         verdict=verdict,
         checklist=checklist,
         body=body_display,
+        session_id=session_id,
     ), []
 
 

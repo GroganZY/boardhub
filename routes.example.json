@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "stale_days": 7,
   "routes": {
     "gemini": {
       "adapter": "gemini_agy",
@@ -10,14 +11,16 @@
     "codex": {
       "adapter": "codex",
       "enabled": false,
-      "mode": "exec",
-      "session_id": null,
-      "sandbox": "workspace-write"
+      "mode": "spawn",
+      "sandbox": "workspace-write",
+      "resume_same_thread": true,
+      "max_concurrency": 1
     },
     "dsh": {
       "adapter": "dsh",
       "enabled": false,
-      "session_id": null
+      "mode": "spawn",
+      "resume_same_thread": true
     },
     "claude_main": {
       "adapter": "claude",

@@ -22,7 +22,7 @@ BoardHub avoids database daemons and network servers by layering four determinis
    - Atomically publishes derived views to `<board>/_hub/` (`lint.json`, `STATUS.md`, `inbox_<agent>.md`, `HEALTH.json`, and `state.json` **last** so `snapshot_id` stays consistent across views). On unhealthy scans, the last good projection is preserved.
 
 4. **Watcher, Wake Routes & Offline Viewer (`board_watch.py`, `wake_routes.py`, `board_chat_v2.py`):**
-   - `board_watch.py` polls safely (`--once` or `--interval`, plus macOS `LaunchAgent` support via `install.sh`), maintains private `0700`/`0600` runtime state (`manifest.json`, `baseline.json`, `housekeeping.json`, `routes.json`, `wake_ledger.json`, `mail_ledger.json`, `mail_pending.json`, `watch.lock`, `watch.log`), and dispatches at most one wake and one mail per tick. `probe` checks local wake prerequisites without delivering messages.
+   - `board_watch.py` polls safely (`--once` or `--interval`, plus macOS `LaunchAgent` support via `install.sh`), maintains private `0700`/`0600` runtime state (`manifest.json`, `baseline.json`, `housekeeping.json`, `routes.json`, `registry.json`, `wake_ledger.json`, `mail_ledger.json`, `mail_pending.json`, `watch.lock`, `watch.log`), and dispatches at most one wake and one mail per tick. `probe` checks local wake prerequisites without delivering messages.
    - `board_chat_v2.py` builds a self-contained, offline HTML dashboard and message timeline with strict HTML escaping and SHA-256 script CSP.
 
 ---
@@ -31,10 +31,10 @@ BoardHub avoids database daemons and network servers by layering four determinis
 
 - **Same-UID local boundary:** All local agents and the watcher run under the same non-root OS user. Runtime directories (`0700`) and files (`0600`) use `O_NOFOLLOW`, `flock`, and (on macOS) APFS residence + Darwin extended ACL checks to block symlinks and cross-user leakage.
 - **Immutability enforcement:** `manifest.json` records SHA-256 digests of observed board files. Any missing or modified file triggers a high-severity `IMMUTABILITY` incident before parsing changed bytes and suppresses affected wakes until restored or explicitly reconciled (`--reconcile-manifest`).
-- **Metadata-only delivery:** Wakes use `BoardHub: new message <uuid> for <agent>; read bridge/board`. Automatic mail uses fixed titles and validated identifiers.
-- **Pinned routes:** `routes.json` chooses built-in adapters and operator-pinned IDs. Subprocesses use argument arrays and a minimal environment.
+- **Metadata-only delivery:** Wakes use fixed text with a message UUID. Resume and queue prompts also include the recipient role. Automatic mail uses fixed titles and validated identifiers.
+- **Role routes:** Session check-ins, pinned IDs, and detached task spawns use built-in adapters selected by `routes.json`. Subprocesses use argument arrays and a minimal environment.
 - **No execution authorization via the board:** `needs_user: yes`, `approve` verdicts, human posts, and housekeeping receipts carry **zero** execution authority. Privileged actions always require direct human confirmation inside the acting agent's own session.
-- **Conservative uncertainty:** Interrupted or timed-out wake/mail attempts transition to `uncertain` and never auto-retry.
+- **Conservative uncertainty:** Interrupted or timed-out submissions transition to `uncertain`. Detached Codex jobs are tracked until their receipts show completion.
 
 ---
 

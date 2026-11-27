@@ -6,6 +6,8 @@ Python 3.8+ standard library only.
 
 import contextlib
 from datetime import datetime, timedelta, timezone
+import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -46,13 +48,9 @@ else:
 SCHEMA_VERSION = 2
 RETRY_SEMANTICS_VERSION = 2
 VALID_OUTCOMES = ("accepted", "not_sent", "uncertain", "disabled")
-ROUTE_ADAPTERS = {
-    "gemini": "gemini_agy",
-    "codex": "codex",
-    "dsh": "dsh",
-    "claude_main": "claude",
-    "claude_side": "claude",
-}
+ROUTE_ADAPTERS = board_lint.ROLE_ADAPTERS
+REGISTRY_NAME = "registry.json"
+DEFAULT_STALE_DAYS = 7
 CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
 CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 CLAUDE_BIN = "/usr/local/bin/claude"
@@ -78,8 +76,9 @@ def _default_agy_client() -> str:
 def _default_python_bin() -> str:
     return os.environ.get("BOARDHUB_PYTHON_BIN", "").strip() or DEFAULT_PYTHON_BIN
 
-CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
-SESSION_UUID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+CONVERSATION_ID_RE = board_lint.CONVERSATION_ID_RE
+SESSION_UUID_RE = board_lint.SESSION_UUID_RE
+CONFIG_TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}")
 SAFE_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 
 RECIPIENT_COOLDOWN_SECONDS = 60
@@ -122,6 +121,7 @@ def build_wake_prompt(message_uuid: str, agent: str) -> str:
 def default_route_config() -> dict:
     return {
         "version": SCHEMA_VERSION,
+        "stale_days": DEFAULT_STALE_DAYS,
         "routes": {
             agent: {"adapter": "inbox", "enabled": False}
             for agent in sorted(board_lint.VALID_SENDERS)
@@ -143,21 +143,51 @@ def _config_path(value, field: str) -> str:
 
 def _route_id(cfg: dict, field: str, pattern) -> Optional[str]:
     value = cfg.get(field)
-    if value is None and not cfg["enabled"]:
+    if value is None and not cfg.get("pin", False):
         return None
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise RouteConfigError(f"Invalid or missing {field}.")
     return value
 
 
+def _boolean(cfg: dict, field: str, default: bool) -> bool:
+    value = cfg.get(field, default)
+    if type(value) is not bool:
+        raise RouteConfigError(f"{field} must be a boolean.")
+    return value
+
+
+def _positive_int(cfg: dict, field: str, default: int) -> int:
+    value = cfg.get(field, default)
+    if type(value) is not int or value < 1:
+        raise RouteConfigError(f"{field} must be a positive integer.")
+    return value
+
+
+def _optional_token(cfg: dict, field: str) -> Optional[str]:
+    value = cfg.get(field)
+    if value is not None and (not isinstance(value, str) or not CONFIG_TOKEN_RE.fullmatch(value)):
+        raise RouteConfigError(f"Invalid {field}.")
+    return value
+
+
+def _route_id_field(route: dict) -> str:
+    if route["adapter"] == "gemini_agy":
+        return "conversation_id"
+    if route["adapter"] == "codex" and route.get("mode") == "queue":
+        return "thread_id"
+    return "session_id"
+
+
 def validate_route_config(raw_obj: dict) -> dict:
     """Strictly validate private routes without accepting shell commands or templates."""
     if not isinstance(raw_obj, dict) or raw_obj.get("version") != SCHEMA_VERSION:
         raise RouteConfigError("Route config must be a JSON object with version 2.")
-    if set(raw_obj) - {"version", "routes", "mail"} or not isinstance(raw_obj.get("routes"), dict):
+    if set(raw_obj) - {"version", "routes", "mail", "stale_days"} or not isinstance(raw_obj.get("routes"), dict):
         raise RouteConfigError("Unexpected or missing top-level keys in route config.")
 
     result = default_route_config()
+    result["stale_days"] = _positive_int(raw_obj, "stale_days", DEFAULT_STALE_DAYS)
     for agent, cfg in raw_obj["routes"].items():
         if agent not in result["routes"]:
             raise RouteConfigError("Unknown route recipient.")
@@ -170,31 +200,43 @@ def validate_route_config(raw_obj: dict) -> dict:
         if adapter == "inbox":
             route["enabled"] = False
         elif adapter == "gemini_agy":
-            route["conversation_id"] = _route_id(cfg, "conversation_id", CONVERSATION_ID_RE)
             route["agy_client_path"] = _config_path(cfg.get("agy_client_path", _default_agy_client()), "agy_client_path")
             route["python_bin"] = _config_path(cfg.get("python_bin", _default_python_bin()), "python_bin")
         elif adapter == "codex":
             mode = cfg.get("mode", "exec")
-            if mode not in ("exec", "queue"):
-                raise RouteConfigError("Codex mode must be exec or queue.")
-            route["mode"] = mode
+            if mode not in ("exec", "resume", "queue", "spawn"):
+                raise RouteConfigError("Codex mode must be resume, exec, queue or spawn.")
+            route["mode"] = "exec" if mode == "resume" else mode
             route["codex_bin"] = _config_path(cfg.get("codex_bin", CODEX_BIN), "codex_bin")
             workdir = cfg.get("project_dir")
             route["project_dir"] = _config_path(workdir, "project_dir") if workdir is not None else None
-            if mode == "exec":
-                route["session_id"] = _route_id(cfg, "session_id", SESSION_UUID_RE)
+            if mode != "queue":
                 sandbox = cfg.get("sandbox", "workspace-write")
                 if sandbox not in CODEX_SANDBOXES:
                     raise RouteConfigError("Invalid Codex sandbox.")
                 route["sandbox"] = sandbox
-            else:
-                route["thread_id"] = _route_id(cfg, "thread_id", SESSION_UUID_RE)
+            if mode == "spawn":
+                route["max_concurrency"] = _positive_int(cfg, "max_concurrency", 1)
+                for field in ("model", "effort", "service_tier"):
+                    route[field] = _optional_token(cfg, field)
         elif adapter == "dsh":
-            route["session_id"] = _route_id(cfg, "session_id", CONVERSATION_ID_RE)
+            mode = cfg.get("mode", "resume")
+            if mode not in ("resume", "spawn"):
+                raise RouteConfigError("DSH mode must be resume or spawn.")
+            route["mode"] = mode
             route["socket_path"] = _config_path(cfg.get("socket_path", str(DSH_SOCKET)), "socket_path")
+            if mode == "spawn":
+                cwd = cfg.get("cwd")
+                route["cwd"] = _config_path(cwd, "cwd") if cwd is not None else None
+                route["permissionPreset"] = _optional_token(cfg, "permissionPreset")
         elif adapter == "claude":
-            route["session_id"] = _route_id(cfg, "session_id", SESSION_UUID_RE)
             route["claude_bin"] = _config_path(cfg.get("claude_bin", CLAUDE_BIN), "claude_bin")
+        if route.get("mode") == "spawn":
+            route["resume_same_thread"] = _boolean(cfg, "resume_same_thread", True)
+        elif adapter != "inbox":
+            route["pin"] = _boolean(cfg, "pin", False)
+            field = _route_id_field(route)
+            route[field] = _route_id(cfg, field, board_lint.SESSION_ID_PATTERNS[adapter])
         if set(cfg) - set(route):
             raise RouteConfigError(f"Unexpected fields in {agent} route.")
         result["routes"][agent] = route
@@ -223,6 +265,124 @@ def load_route_config(path: Path) -> Tuple[dict, bool]:
         return validate_route_config(obj), False
     except RouteConfigError:
         return default_route_config(), True
+
+
+class RoleRegistry:
+    """Private routes derived from validated, immutable board control records."""
+
+    def __init__(self, path: Path, roles: dict):
+        self.path = path
+        self.roles = roles
+
+    @classmethod
+    def load(cls, path: Path) -> Tuple["RoleRegistry", bool]:
+        try:
+            obj = board_lint.read_private_json_file(path)
+        except (board_lint.SecurityError, board_lint.FormatError, OSError):
+            return cls(path, {}), True
+        if obj is None:
+            return cls(path, {}), False
+        roles = obj.get("roles")
+        if obj.get("version") != SCHEMA_VERSION or not isinstance(roles, dict):
+            return cls(path, {}), True
+        claimed = set()
+        for role, record in roles.items():
+            if role not in ROUTE_ADAPTERS or not isinstance(record, dict) or set(record) != {
+                "filename", "event_id", "session_id", "sent_at", "checked_in_at", "confirmed", "last_successful_wake_at",
+            }:
+                return cls(path, {}), True
+            filename = record.get("filename")
+            match = board_lint.V2_FILENAME_RE.fullmatch(filename) if isinstance(filename, str) else None
+            session = record.get("session_id")
+            last_wake = record.get("last_successful_wake_at")
+            adapter = ROUTE_ADAPTERS[role]
+            if (
+                not match or match[2] != role or match[4] != record.get("event_id")
+                or not board_lint.UUID_V4_RE.fullmatch(match[4])
+                or board_lint.parse_utc_rfc3339(record.get("sent_at")) is None
+                or (session is None and record["checked_in_at"] is not None)
+                or (session is not None and board_lint.parse_utc_rfc3339(record["checked_in_at"]) is None)
+                or (last_wake is not None and board_lint.parse_utc_rfc3339(last_wake) is None)
+                or type(record.get("confirmed")) is not bool
+                or (session is not None and (
+                    not isinstance(session, str) or not board_lint.SESSION_ID_PATTERNS[adapter].fullmatch(session)
+                ))
+            ):
+                return cls(path, {}), True
+            if session is not None and record["confirmed"]:
+                if (adapter, session) in claimed:
+                    return cls(path, {}), True
+                claimed.add((adapter, session))
+        return cls(path, roles), False
+
+    def save(self) -> None:
+        data = json.dumps({"version": SCHEMA_VERSION, "roles": self.roles}, indent=2, sort_keys=True)
+        board_lint.atomic_write_private_file(self.path, (data + "\n").encode("utf-8"))
+
+    @staticmethod
+    def _order(event: dict) -> tuple:
+        return board_lint.parse_utc_rfc3339(event["sent_at"]), event["filename"]
+
+    def sync(self, events: dict, now: datetime) -> None:
+        """Keep checkout tombstones and never resurrect an older or invalidated route."""
+        changed = False
+        for role in sorted(self.roles.keys() | events.keys()):
+            old, event = self.roles.get(role), events.get(role)
+            if event is not None and (old is None or self._order(event) > self._order(old)):
+                checked_in_at = None
+                if event["session_id"] is not None:
+                    checked_in_at = board_lint.format_utc_rfc3339(min(self._order(event)[0], now))
+                self.roles[role] = {
+                    **event, "confirmed": True, "last_successful_wake_at": None, "checked_in_at": checked_in_at,
+                }
+                changed = True
+            elif old is not None:
+                confirmed = event is not None and event["event_id"] == old["event_id"]
+                if old["confirmed"] != confirmed:
+                    old["confirmed"] = confirmed
+                    changed = True
+        if changed:
+            self.save()
+
+    @staticmethod
+    def _stale(record: dict, now: datetime, stale_days: int) -> bool:
+        checked_in = board_lint.parse_utc_rfc3339(record["checked_in_at"])
+        last_wake = board_lint.parse_utc_rfc3339(record["last_successful_wake_at"])
+        return (now - max(checked_in, last_wake or checked_in)).total_seconds() >= stale_days * 86400
+
+    def resolve(self, role: str, route: dict, now: datetime, stale_days: int) -> Tuple[Optional[dict], str]:
+        if route["adapter"] == "inbox":
+            return None, "inbox_only"
+        if route.get("mode") == "spawn":
+            return route, "ok"
+        field = _route_id_field(route)
+        record = self.roles.get(role)
+        if route["pin"] or record is None:
+            return (route, "ok") if route[field] else (None, "awaiting_checkin")
+        session = record["session_id"]
+        if session is None or not record["confirmed"]:
+            return None, "awaiting_checkin"
+        if self._stale(record, now, stale_days):
+            return None, "stale"
+        return {**route, field: session}, "ok"
+
+    def note_wake(self, role: str, now: datetime) -> None:
+        record = self.roles[role]
+        previous = board_lint.parse_utc_rfc3339(record["last_successful_wake_at"])
+        if previous is None or now > previous:
+            record["last_successful_wake_at"] = board_lint.format_utc_rfc3339(now)
+            self.save()
+
+    def stale_items(self, config: dict, now: datetime) -> List[dict]:
+        items = []
+        for role, route in config["routes"].items():
+            if route["enabled"] and self.resolve(role, route, now, config["stale_days"])[1] == "stale":
+                event_id = self.roles[role]["event_id"]
+                items.append({
+                    "item_id": f"route_stale:{role}:{event_id}", "reason_code": "route_stale",
+                    "message_id": event_id, "thread_id": None,
+                })
+        return items
 
 
 def _validate_executable_file(path_str: str, allow_owner_exec: bool = True) -> Path:
@@ -448,33 +608,28 @@ def _read_dsh_reply(connection, deadline: float) -> bytes:
     raise ValueError("Invalid or oversized broker frame.")
 
 
-def run_dsh_continue(route: dict, prompt: str, timeout: float) -> Tuple[str, str]:
+def _dsh_call(route: dict, name: str, arguments: dict, timeout: float) -> Tuple[str, str, Optional[dict]]:
     """Send one newline-delimited JSON-RPC request through the local DSH broker."""
     deadline = time.monotonic() + timeout
     path = Path(route["socket_path"])
     request = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "dsh_continue_session",
-            "arguments": {"sessionId": route["session_id"], "prompt": prompt, "wait": False},
-        },
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
     }
     wire = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
     try:
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     except OSError:
-        return "not_sent", "client_start_failed"
+        return "not_sent", "client_start_failed", None
     with connection:
         try:
             _check_broker_socket(path)
             connection.settimeout(_remaining(deadline))
             connection.connect(str(path))
         except RouteConfigError:
-            return "not_sent", "unsafe_socket"
+            return "not_sent", "unsafe_socket", None
         except OSError:
-            return "not_sent", "broker_unavailable"
+            return "not_sent", "broker_unavailable", None
         try:
             connection.settimeout(_remaining(deadline))
             connection.sendall(wire)
@@ -482,7 +637,7 @@ def run_dsh_continue(route: dict, prompt: str, timeout: float) -> Tuple[str, str
                 _read_dsh_reply(connection, deadline), max_bytes=MAX_CLIENT_OUTPUT_BYTES, max_depth=12,
             )
         except (OSError, ValueError, board_lint.FormatError):
-            return "uncertain", "broker_exchange_failed"
+            return "uncertain", "broker_exchange_failed", None
     response = envelope.get("response") if isinstance(envelope, dict) and envelope.get("ok") is True else None
     if (
         not isinstance(response, dict)
@@ -491,15 +646,172 @@ def run_dsh_continue(route: dict, prompt: str, timeout: float) -> Tuple[str, str
         or response["id"] != request["id"]
         or "error" in response
     ):
-        return "uncertain", "broker_rejected_or_invalid_reply"
+        return "uncertain", "broker_rejected_or_invalid_reply", None
     result = response.get("result")
     if (
         not isinstance(result, dict)
         or result.get("isError", False) is not False
         or not (isinstance(result.get("content"), list) or isinstance(result.get("structuredContent"), dict))
     ):
-        return "uncertain", "broker_rejected_or_invalid_reply"
-    return "accepted", "accepted"
+        return "uncertain", "broker_rejected_or_invalid_reply", None
+    return "accepted", "accepted", result
+
+
+def run_dsh_continue(route: dict, prompt: str, timeout: float) -> Tuple[str, str]:
+    outcome, code, _ = _dsh_call(
+        route, "dsh_continue_session", {"sessionId": route["session_id"], "prompt": prompt, "wait": False}, timeout,
+    )
+    return outcome, code
+
+
+def run_dsh_spawn(route: dict, prompt: str, workdir: Path, timeout: float) -> Tuple[str, str, Optional[str]]:
+    arguments = {"cwd": str(workdir), "prompt": prompt, "wait": False}
+    if route["permissionPreset"] is not None:
+        arguments["permissionPreset"] = route["permissionPreset"]
+    outcome, code, result = _dsh_call(route, "dsh_run_prompt", arguments, timeout)
+    if outcome != "accepted":
+        return outcome, code, None
+    ids = []
+    if isinstance(result.get("structuredContent"), dict):
+        ids.append(result["structuredContent"].get("sessionId"))
+    content = result.get("content")
+    for item in content if isinstance(content, list) else ():
+        if not isinstance(item, dict) or item.get("type") != "text" or not isinstance(item.get("text"), str):
+            continue
+        try:
+            value = board_lint.decode_json_strict(item["text"].encode("utf-8"), max_bytes=MAX_CLIENT_OUTPUT_BYTES)
+        except board_lint.FormatError:
+            continue
+        if isinstance(value, dict):
+            ids.append(value.get("sessionId"))
+    ids = [value for value in ids if value is not None]
+    if not ids or any(not isinstance(value, str) or not CONVERSATION_ID_RE.fullmatch(value) for value in ids):
+        return "uncertain", "broker_invalid_session_id", None
+    if len(set(ids)) != 1:
+        return "uncertain", "broker_invalid_session_id", None
+    return outcome, code, ids[0]
+
+
+# A detached supervisor holds this receipt's lock until the CLI exits. The
+# watcher can observe it after restart without trusting a recycled PID.
+_CODEX_WORKERS: List[subprocess.Popen] = []
+
+
+def _spawn_workdir(route: dict, project_dir: Optional[Path]) -> Path:
+    configured = route.get("cwd") if route["adapter"] == "dsh" else route.get("project_dir")
+    path = Path(configured) if configured is not None else project_dir
+    if path is None or not path.is_absolute() or not path.is_dir():
+        raise RouteConfigError("Spawn requires an existing project directory.")
+    return path
+
+
+def _spawn_target(route: dict, workdir: Path) -> str:
+    endpoint = route["socket_path"] if route["adapter"] == "dsh" else route["codex_bin"]
+    return hashlib.sha256(f"{route['adapter']}\0{endpoint}\0{workdir}".encode("utf-8")).hexdigest()
+
+
+def _codex_spawn_argv(route: dict, workdir: Path, prompt: str, session_id: Optional[str]) -> List[str]:
+    binary = str(_trusted_program(route["codex_bin"]))
+    argv = [binary, "exec", "-C", str(workdir), "--sandbox", route["sandbox"], "--json"]
+    if route["model"] is not None:
+        argv.extend(["--model", route["model"]])
+    for field, key in (("effort", "model_reasoning_effort"), ("service_tier", "service_tier")):
+        if route[field] is not None:
+            argv.extend(["-c", f"{key}={json.dumps(route[field])}"])
+    if session_id is not None:
+        argv.extend(["resume", "--skip-git-repo-check", session_id])
+    else:
+        argv.append("--skip-git-repo-check")
+    argv.append(prompt)
+    return argv
+
+
+def _codex_receipt(runtime_dir: Path, uuid: str) -> Path:
+    if not board_lint.UUID_V4_RE.fullmatch(uuid):
+        raise ValueError("Invalid spawn receipt ID.")
+    return runtime_dir / f"codex-spawn-{uuid}.jsonl"
+
+
+def _start_codex_job(path: Path, argv: List[str], workdir: Path) -> Tuple[str, str]:
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        return "uncertain", "spawn_receipt_exists"
+    except OSError:
+        return "not_sent", "client_start_failed"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        worker = subprocess.Popen(
+            ["/usr/bin/python3", "-B", "-I", str(Path(__file__).resolve()), "--codex-worker", str(fd), *argv],
+            cwd=workdir, env=_minimal_child_env(), start_new_session=True, pass_fds=(fd,),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        _CODEX_WORKERS.append(worker)
+    except OSError:
+        return "not_sent", "client_start_failed"
+    finally:
+        os.close(fd)
+    return "accepted", "spawn_started"
+
+
+def _codex_worker(fd: int, argv: List[str]) -> None:
+    os.umask(0o077)
+
+    def record(**data) -> None:
+        os.write(fd, (json.dumps(data, separators=(",", ":")) + "\n").encode("ascii"))
+        os.fsync(fd)
+
+    with subprocess.Popen(
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=(fd,),
+    ) as child:
+        record(pid=child.pid)
+        output = child.stdout
+        while True:
+            line = output.readline(MAX_CLIENT_OUTPUT_BYTES + 1)
+            if not line:
+                break
+            if not line.endswith(b"\n"):
+                while line and not line.endswith(b"\n"):
+                    line = output.readline(MAX_CLIENT_OUTPUT_BYTES + 1)
+                continue
+            if b'"thread.started"' not in line:
+                continue
+            try:
+                event = board_lint.decode_json_strict(line, max_bytes=MAX_CLIENT_OUTPUT_BYTES)
+            except board_lint.FormatError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "thread.started":
+                continue
+            session = event.get("thread_id")
+            if isinstance(session, str) and SESSION_UUID_RE.fullmatch(session):
+                record(session_id=session)
+                # Drain remaining events without storing prompts or agent output.
+                for _ in iter(lambda: output.read(65536), b""):
+                    pass
+                break
+        record(returncode=child.wait())
+
+
+def _read_codex_receipt(path: Path) -> Tuple[dict, bool]:
+    try:
+        fd = board_lint.verify_regular_file(path)
+    except board_lint.SecurityError:
+        if not path.exists() and not path.is_symlink():
+            return {}, False
+        raise
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            running = False
+        except BlockingIOError:
+            running = True
+        chunks = os.read(fd, 513).split(b"\n")
+        data = {}
+        for line in chunks[:-1]:
+            data.update(board_lint.decode_json_strict(line, max_bytes=512))
+        return data, running
+    finally:
+        os.close(fd)
 
 
 def _run_cli_wake(route: dict, prompt: str, project_dir: Optional[Path], timeout: float) -> Tuple[str, str]:
@@ -537,30 +849,31 @@ def _probe_socket(path: Path) -> None:
         connection.connect(str(path))
 
 
-def probe_routes(config: dict) -> dict:
-    """Check configured wake route prerequisites locally. Do not spawn or write to sockets."""
+def probe_routes(
+    config: dict, registry: Optional[RoleRegistry] = None, project_dir: Optional[Path] = None,
+) -> dict:
+    """Check local prerequisites. Do not spawn or write to sockets."""
+    registry = registry or RoleRegistry(Path(REGISTRY_NAME), {})
+    now = datetime.now(timezone.utc)
     results = {}
     for agent, route in sorted(config["routes"].items()):
         adapter = route["adapter"]
         if adapter == "inbox":
             continue
-        status = "ok"
-        id_field = {"gemini_agy": "conversation_id", "dsh": "session_id", "claude": "session_id",
-                    "codex": "thread_id" if route.get("mode") == "queue" else "session_id"}[adapter]
-        if route[id_field] is None:
-            status = "missing_id"
-        else:
-            try:
-                if adapter == "gemini_agy":
-                    _validate_executable_file(route["agy_client_path"])
-                    _trusted_program(route["python_bin"])
-                    _probe_socket(GEMINI_SOCKET)
-                elif adapter == "dsh":
-                    _probe_socket(Path(route["socket_path"]))
-                else:
-                    _trusted_program(route["codex_bin"] if adapter == "codex" else route["claude_bin"])
-            except (OSError, RuntimeError, RouteConfigError, board_lint.SecurityError):
-                status = "prerequisite_unavailable"
+        _, status = registry.resolve(agent, route, now, config["stale_days"])
+        try:
+            if adapter == "gemini_agy":
+                _validate_executable_file(route["agy_client_path"])
+                _trusted_program(route["python_bin"])
+                _probe_socket(GEMINI_SOCKET)
+            elif adapter == "dsh":
+                _probe_socket(Path(route["socket_path"]))
+            else:
+                _trusted_program(route["codex_bin"] if adapter == "codex" else route["claude_bin"])
+            if route.get("mode") == "spawn":
+                _spawn_workdir(route, project_dir)
+        except (OSError, RuntimeError, RouteConfigError, board_lint.SecurityError):
+            status = "prerequisite_unavailable"
         results[agent] = {"adapter": adapter, "enabled": route["enabled"], "status": status}
     return results
 
@@ -628,7 +941,26 @@ class WakeLedger:
         for key, rec in records.items():
             if not isinstance(key, str) or not isinstance(rec, dict):
                 return cls(path, cls._empty_state()), True
-            if rec.get("status") == "attempting":
+            spawn = rec.get("spawn")
+            if spawn is not None and (
+                not isinstance(spawn, dict)
+                or spawn.get("adapter") not in ("codex", "dsh")
+                or spawn["adapter"] != rec.get("agent")
+                or not isinstance(spawn.get("thread_id"), str)
+                or not board_lint.UUID_V4_RE.fullmatch(spawn["thread_id"])
+                or not isinstance(spawn.get("target"), str)
+                or not board_lint.SHA256_LOWER_RE.fullmatch(spawn["target"])
+                or board_lint.parse_utc_rfc3339(rec.get("last_attempt_at")) is None
+                or not isinstance(rec.get("message_uuid"), str)
+                or not board_lint.UUID_V4_RE.fullmatch(rec["message_uuid"])
+                or ("session_id" in spawn and (
+                    not isinstance(spawn["session_id"], str)
+                    or not board_lint.SESSION_ID_PATTERNS[spawn["adapter"]].fullmatch(spawn["session_id"])
+                ))
+                or ("pid" in spawn and (type(spawn["pid"]) is not int or spawn["pid"] <= 0))
+            ):
+                return cls(path, cls._empty_state()), True
+            if rec.get("status") == "attempting" and not (spawn and spawn["adapter"] == "codex"):
                 rec["status"] = "uncertain"
                 rec["operator_action_required"] = True
                 rec["last_reason_code"] = "interrupted_attempt"
@@ -688,9 +1020,11 @@ class WakeLedger:
             enabled = bool(rcfg.get("enabled") and rcfg.get("adapter") != "inbox")
             prev = rb.get(agent)
             if enabled:
-                if not isinstance(prev, dict) or not prev.get("enabled"):
+                spawn = rcfg.get("mode") == "spawn"
+                if not isinstance(prev, dict) or not prev.get("enabled") or prev.get("spawn", False) != spawn:
                     rb[agent] = {
                         "enabled": True,
+                        "spawn": spawn,
                         "opted_in_at": now_str,
                         "baseline_uuids": sorted(current_accepted_uuids),
                     }
@@ -762,7 +1096,7 @@ class WakeLedger:
             return now.astimezone(timezone.utc) >= retry_after
         return False
 
-    def begin_attempt(self, agent: str, message_uuid: str, now: datetime) -> None:
+    def begin_attempt(self, agent: str, message_uuid: str, now: datetime, spawn: Optional[dict] = None) -> None:
         key = self._key(agent, message_uuid)
         now_str = board_lint.format_utc_rfc3339(now)
         rec = self.state["records"].get(key)
@@ -780,6 +1114,10 @@ class WakeLedger:
                 "last_attempt_at": now_str,
             }
             self.state["records"][key] = rec
+        if spawn is not None:
+            rec["spawn"] = spawn
+        else:
+            rec.pop("spawn", None)
         rec["status"] = "attempting"
         rec["attempt_count"] = int(rec.get("attempt_count", 0)) + 1
         rec["last_attempt_at"] = now_str
@@ -831,6 +1169,59 @@ class WakeLedger:
             })
         self.save()
 
+    def refresh_codex_jobs(self, now: datetime) -> None:
+        """Collect only metadata from detached jobs and release finished slots."""
+        _CODEX_WORKERS[:] = [worker for worker in _CODEX_WORKERS if worker.poll() is None]
+        changed = False
+        for rec in self.state["records"].values():
+            spawn = rec.get("spawn", {})
+            if rec["status"] != "attempting" or spawn.get("adapter") != "codex":
+                continue
+            try:
+                receipt = _codex_receipt(self.path.parent, rec["message_uuid"])
+                data, running = _read_codex_receipt(receipt)
+            except (board_lint.SecurityError, board_lint.FormatError, OSError, TypeError, ValueError):
+                # An unreadable receipt may belong to a running child. Hold its slot.
+                continue
+            pid, session = data.get("pid"), data.get("session_id")
+            if type(pid) is int and pid > 0 and spawn.get("pid") != pid:
+                spawn["pid"] = pid
+                changed = True
+            if isinstance(session, str) and SESSION_UUID_RE.fullmatch(session) and spawn.get("session_id") != session:
+                spawn["session_id"] = session
+                changed = True
+            if running:
+                continue
+            ok = type(data.get("returncode")) is int and data["returncode"] == 0 and "session_id" in spawn
+            started = board_lint.parse_utc_rfc3339(rec["last_attempt_at"])
+            duration_ms = max(0, int((now - started).total_seconds() * 1000))
+            self.finish_attempt(
+                rec["agent"], rec["message_uuid"], "accepted" if ok else "uncertain",
+                "accepted" if ok else "spawn_failed_or_interrupted", duration_ms, now,
+            )
+            changed = False  # finish_attempt persisted all metadata collected so far.
+            with contextlib.suppress(OSError):
+                receipt.unlink()
+        if changed:
+            self.save()
+
+    def spawn_slot_available(self, agent: str, route: dict, thread_id: str) -> bool:
+        if route.get("mode") != "spawn" or route["adapter"] != "codex":
+            return True
+        active = [r["spawn"] for r in self.state["records"].values()
+                  if r.get("agent") == agent and r.get("status") == "attempting" and "spawn" in r]
+        if route["resume_same_thread"] and any(r["thread_id"] == thread_id for r in active):
+            return False
+        return len(active) < route["max_concurrency"]
+
+    def previous_session(self, agent: str, thread_id: str, target: str) -> Optional[str]:
+        matches = [r for r in self.state["records"].values() if r.get("agent") == agent
+                   and r.get("spawn", {}).get("thread_id") == thread_id and r.get("status") != "not_sent"]
+        latest = max(matches, key=lambda r: r["last_attempt_at"], default=None)
+        if latest and latest["status"] == "accepted" and latest["spawn"]["target"] == target:
+            return latest["spawn"].get("session_id")
+        return None
+
     def attention_items(self) -> List[dict]:
         """Return metadata-only operator attention items for uncertain/probe/exhausted wakes."""
         items: List[dict] = []
@@ -865,6 +1256,7 @@ def wake(
     log_fn: Optional[Callable[[str], None]] = None,
     require_existing_ledger: Optional[bool] = None,
     project_dir: Optional[Path] = None,
+    thread_id: Optional[str] = None,
 ) -> str:
     """Dispatch a single validated wake notification according to APFS route config & ledger.
 
@@ -905,6 +1297,12 @@ def wake(
         return "not_sent"
 
     rdir = Path(runtime_dir)
+    registry, registry_corrupt = RoleRegistry.load(rdir / REGISTRY_NAME)
+    if registry_corrupt:
+        return "not_sent"
+    route, _ = registry.resolve(agent, route, now, cfg["stale_days"])
+    if route is None:
+        return "disabled"
     ledger_path = rdir / "wake_ledger.json"
     if require_existing_ledger is None:
         allow_missing = not is_wake_ledger_initialized(rdir)
@@ -918,6 +1316,7 @@ def wake(
                 f"agent={agent} uuid={message_uuid} status=not_sent code=wake_ledger_missing_or_corrupt duration_ms=0"
             )
         return "not_sent"
+    ledger.refresh_codex_jobs(now)
     if not ledger.is_eligible(agent, message_uuid, now):
         rec = ledger.get_record(agent, message_uuid)
         if rec and rec.get("status") in ("accepted", "not_sent", "uncertain"):
@@ -932,11 +1331,50 @@ def wake(
             )
         return "not_sent"
 
-    ledger.begin_attempt(agent, message_uuid, now)
+    spawn = None
+    argv = None
+    previous = None
+    if route.get("mode") == "spawn":
+        thread_id = message_uuid if thread_id is None else thread_id
+        if not isinstance(thread_id, str) or not board_lint.UUID_V4_RE.fullmatch(thread_id):
+            raise ValueError("thread_id must be a canonical lowercase UUIDv4.")
+        if not ledger.spawn_slot_available(agent, route, thread_id):
+            return "not_sent"
+        prompt = f"BoardHub: new message {message_uuid}; read bridge/board"
+        try:
+            workdir = _spawn_workdir(route, project_dir)
+            target = _spawn_target(route, workdir)
+            if route["resume_same_thread"]:
+                previous = ledger.previous_session(agent, thread_id, target)
+            if route["adapter"] == "codex":
+                argv = _codex_spawn_argv(route, workdir, prompt, previous)
+        except (OSError, RouteConfigError, RuntimeError):
+            ledger.begin_attempt(agent, message_uuid, now)
+            ledger.finish_attempt(agent, message_uuid, "not_sent", "invalid_config", 0, now)
+            return "not_sent"
+        spawn = {"adapter": route["adapter"], "thread_id": thread_id, "target": target}
+
+    ledger.begin_attempt(agent, message_uuid, now, spawn=spawn)
 
     t0 = time.monotonic()
     try:
-        if route["adapter"] == "gemini_agy":
+        if argv is not None:
+            receipt = _codex_receipt(rdir, message_uuid)
+            outcome, reason_code = _start_codex_job(receipt, argv, workdir)
+            if outcome == "accepted":
+                if log_fn is not None:
+                    log_fn(f"ts={board_lint.format_utc_rfc3339(now)} route=codex agent={agent} "
+                           f"uuid={message_uuid} status=accepted code=spawn_started duration_ms=0")
+                return outcome  # The watcher observes the receipt on subsequent ticks.
+        elif spawn is not None:
+            if previous is None:
+                outcome, reason_code, session_id = run_dsh_spawn(route, prompt, workdir, OUTER_DEADLINE_SECONDS)
+            else:
+                outcome, reason_code = run_dsh_continue({**route, "session_id": previous}, prompt, OUTER_DEADLINE_SECONDS)
+                session_id = previous
+            if outcome == "accepted":
+                spawn["session_id"] = session_id
+        elif route["adapter"] == "gemini_agy":
             runner = agy_runner or run_agy_client_send
             outcome, reason_code = runner(
                 conversation_id=route["conversation_id"],
@@ -961,6 +1399,8 @@ def wake(
 
     finish_now = clock()
     ledger.finish_attempt(agent, message_uuid, outcome, reason_code, duration_ms, finish_now)
+    if outcome == "accepted" and spawn is None and not route["pin"] and agent in registry.roles:
+        registry.note_wake(agent, finish_now)
 
     if log_fn is not None:
         log_fn(
@@ -1032,10 +1472,8 @@ class MailLedger:
         previous = self.state.get("auto", {})
         if previous.get("enabled") is enabled:
             return
-        self.state["auto"] = {
-            "enabled": enabled,
-            "baseline": sorted({item["item_id"] for item in items}) if enabled else [],
-        }
+        baseline = {item["item_id"] for item in items if item["reason_code"] != "route_stale"} if enabled else set()
+        self.state["auto"] = {"enabled": enabled, "baseline": sorted(baseline)}
         self.save()
 
     def next_auto_item(self, items: List[dict], now: datetime) -> Optional[dict]:
@@ -1094,6 +1532,7 @@ class MailLedger:
 MAIL_DAILY_ATTEMPT_CAP = 20
 MAIL_TITLES = {
     "needs_user": "Human review requested",
+    "route_stale": "Agent route stale. Check-in needed",
     "loop_breaker_30": "Thread paused at 30 messages",
 }
 
@@ -1102,6 +1541,7 @@ def automatic_mail_items(digest: dict) -> List[dict]:
     return [
         item for item in digest["items"]
         if item["kind"] == "high_incident"
+        or (item["kind"] == "wake_attention" and item["reason_code"] == "route_stale")
         or (item["kind"] == "pending" and item["reason_code"] in MAIL_TITLES)
     ]
 
@@ -1134,3 +1574,9 @@ def run_mail_notifier(path: Path, item: dict, timeout: float = OUTER_DEADLINE_SE
         return "sent", "sent"
     # Exit 1 can mean a quota rejection or an ambiguous SMTP failure.
     return "uncertain", "notifier_exit_failed"
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4 or sys.argv[1] != "--codex-worker":
+        raise SystemExit(2)
+    _codex_worker(int(sys.argv[2]), sys.argv[3:])

@@ -360,6 +360,9 @@ def bootstrap_runtime(
     route_cfg, route_corrupt = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
     if route_corrupt:
         raise WatcherError("Route config is corrupt during bootstrap.")
+    registry, registry_corrupt = wake_routes.RoleRegistry.load(runtime_dir / wake_routes.REGISTRY_NAME)
+    if registry_corrupt:
+        raise WatcherError("Role registry is corrupt during bootstrap.")
 
     hk_ids, _hk_obj, hk_corrupt = board_state.load_housekeeping_receipts(runtime_dir / HOUSEKEEPING_NAME)
     if hk_corrupt:
@@ -417,6 +420,10 @@ def bootstrap_runtime(
         health_record=health_rec,
         expected_root_id=pinned_root_id,
     )
+    if not result["health"]["live_dispatch_suppressed"]:
+        registry.sync(result["registry_events"], now)
+    if not registry.path.exists():
+        registry.save()
     _write_apfs_json(runtime_dir / MAIL_PENDING_NAME, result["mail_pending"])
     _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
     _write_apfs_json(runtime_dir / LAST_PUBLISHED_NAME, {"snapshot_id": result["snapshot_id"], "as_of": result["as_of"]})
@@ -522,6 +529,7 @@ def run_tick(
     baseline_uuids, b_corrupt = _load_baseline(runtime_dir / BASELINE_NAME)
     hk_ids, _hk_obj, hk_corrupt = board_state.load_housekeeping_receipts(runtime_dir / HOUSEKEEPING_NAME)
     route_cfg, r_corrupt = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
+    registry, rg_corrupt = wake_routes.RoleRegistry.load(runtime_dir / wake_routes.REGISTRY_NAME)
     ledger_initialized = (
         wake_routes.is_wake_ledger_initialized(runtime_dir)
         or manifest is not None
@@ -544,7 +552,7 @@ def run_tick(
         and manifest is None and not m_corrupt
         and baseline_uuids is None and not b_corrupt
     )
-    runtime_corrupt = any((m_corrupt, b_corrupt, hk_corrupt, r_corrupt, wl_corrupt, ml_corrupt, lp_corrupt))
+    runtime_corrupt = any((m_corrupt, b_corrupt, hk_corrupt, r_corrupt, rg_corrupt, wl_corrupt, ml_corrupt, lp_corrupt))
     if ledger_initialized and (manifest is None or baseline_uuids is None):
         runtime_corrupt = True
 
@@ -637,33 +645,44 @@ def run_tick(
     accepted_uuids = _extract_accepted_uuids(result)
     wake_ledger.sync_route_baselines(route_cfg, accepted_uuids, now)
 
-    # 5. Merge wake attention items into mail_pending.json on APFS
-    mail_digest = board_state.build_mail_digest_payload(
-        snapshot_id=result["snapshot_id"],
-        as_of=result["as_of"],
-        open_pending=result["state"]["pending"],
-        high_incidents=[
-            {
-                "incident_id": board_state._make_incident_id(
-                    board_lint.Diagnostic(
-                        severity=d["severity"],
-                        code=d["code"],
-                        file=d["file"],
-                        message_id=d["message_id"],
-                        thread_id=d["thread_id"],
-                    )
-                ),
-                "code": d["code"],
-                "message_id": d["message_id"],
-                "thread_id": d["thread_id"],
-            }
-            for d in result["lint"]["diagnostics"]
-            if d["severity"] == "high"
-        ],
-        wake_attention_items=wake_ledger.attention_items(),
-    )
-    result["mail_pending"] = mail_digest
-    _write_apfs_json(runtime_dir / MAIL_PENDING_NAME, mail_digest)
+    # 5. Replay validated registrations and collect metadata-only alerts.
+    wake_ledger.refresh_codex_jobs(now)
+    if not result["health"]["live_dispatch_suppressed"] and _verify_board_root_pinned(
+        board_dir, snapshot.root_dev, snapshot.root_ino, expected_board_id=manifest_board_id,
+    ):
+        registry.sync(result["registry_events"], now)
+        if not registry.path.exists():
+            registry.save()
+    high_incidents = [
+        {
+            "incident_id": board_state._make_incident_id(
+                board_lint.Diagnostic(
+                    severity=d["severity"],
+                    code=d["code"],
+                    file=d["file"],
+                    message_id=d["message_id"],
+                    thread_id=d["thread_id"],
+                )
+            ),
+            "code": d["code"],
+            "message_id": d["message_id"],
+            "thread_id": d["thread_id"],
+        }
+        for d in result["lint"]["diagnostics"]
+        if d["severity"] == "high"
+    ]
+
+    def publish_mail_digest(ledger, current_registry, as_of):
+        digest = board_state.build_mail_digest_payload(
+            snapshot_id=result["snapshot_id"], as_of=result["as_of"],
+            open_pending=result["state"]["pending"], high_incidents=high_incidents,
+            wake_attention_items=ledger.attention_items() + current_registry.stale_items(route_cfg, as_of),
+        )
+        result["mail_pending"] = digest
+        _write_apfs_json(runtime_dir / MAIL_PENDING_NAME, digest)
+        return digest
+
+    mail_digest = publish_mail_digest(wake_ledger, registry, now)
 
     # 6. Publish _hub projections if needed
     health_rec = dict(result["health"])
@@ -712,8 +731,9 @@ def run_tick(
         candidates = []
         threads = result["state"]["threads"]
         for agent, items in sorted(result["state"]["inboxes"].items()):
-            rcfg = route_cfg["routes"].get(agent, {"adapter": "inbox", "enabled": False})
-            if not rcfg.get("enabled") or rcfg.get("adapter") == "inbox":
+            rcfg = route_cfg["routes"][agent]
+            resolved, _ = registry.resolve(agent, rcfg, now, route_cfg["stale_days"])
+            if not rcfg["enabled"] or resolved is None:
                 continue
             for item in items:
                 if item["is_broadcast"] or item["is_baseline"]:
@@ -723,12 +743,14 @@ def run_tick(
                     continue
                 if not wake_ledger.is_eligible(agent, item["uuid"], now):
                     continue
-                candidates.append((item["first_observed_at"], item["sent_at"], item["uuid"], agent))
+                if not wake_ledger.spawn_slot_available(agent, rcfg, item["thread_id"]):
+                    continue
+                candidates.append((item["first_observed_at"], item["sent_at"], item["number"], item["uuid"], agent))
 
         candidates.sort()
         if _pre_wake_hook is not None and candidates:
             _pre_wake_hook()
-        for _obs_at, _sent_at, msg_uuid, agent in candidates:
+        for _obs_at, _sent_at, _number, msg_uuid, agent in candidates:
             recheck_now = clock()
             if not _verify_board_root_pinned(
                 board_dir, snapshot.root_dev, snapshot.root_ino, expected_board_id=manifest_board_id
@@ -758,6 +780,7 @@ def run_tick(
             re_base, re_bc = _load_baseline(runtime_dir / BASELINE_NAME)
             re_hk, _re_hk_obj, re_hkc = board_state.load_housekeeping_receipts(runtime_dir / HOUSEKEEPING_NAME)
             re_cfg, re_rc = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
+            re_registry, re_rg = wake_routes.RoleRegistry.load(runtime_dir / wake_routes.REGISTRY_NAME)
             re_wl, re_wlc = wake_routes.WakeLedger.load(runtime_dir / WAKE_LEDGER_NAME, now=recheck_now, allow_missing=False)
             _re_ml, re_mlc = wake_routes.MailLedger.load(
                 runtime_dir / MAIL_LEDGER_NAME, now=recheck_now, allow_missing=False,
@@ -766,7 +789,7 @@ def run_tick(
             if (
                 re_manifest is None
                 or re_base is None
-                or any((re_mc, re_bc, re_hkc, re_rc, re_wlc, re_mlc, re_lpc))
+                or any((re_mc, re_bc, re_hkc, re_rc, re_rg, re_wlc, re_mlc, re_lpc))
             ):
                 health_rec = dict(result["health"])
                 health_rec.update({
@@ -835,7 +858,8 @@ def run_tick(
                 break
 
             re_rcfg = re_cfg["routes"].get(agent, {"adapter": "inbox", "enabled": False})
-            if not re_rcfg.get("enabled") or re_rcfg != route_cfg["routes"][agent]:
+            if (not re_rcfg.get("enabled") or re_rcfg != route_cfg["routes"][agent]
+                    or re_cfg["stale_days"] != route_cfg["stale_days"]):
                 continue
             re_item = next(
                 (it for it in re_res["state"]["inboxes"].get(agent, []) if it["uuid"] == msg_uuid),
@@ -877,8 +901,9 @@ def run_tick(
                     "wake_sent": None,
                 }
 
-            board_parent = Path(board_dir).resolve().parent
-            project_dir = board_parent.parent if board_parent.name == "bridge" else board_parent
+            re_registry.sync(re_res["registry_events"], recheck_now)
+            if re_registry.resolve(agent, re_rcfg, recheck_now, re_cfg["stale_days"])[0] is None:
+                continue
             outcome = wake_routes.wake(
                 agent,
                 msg_uuid,
@@ -888,35 +913,15 @@ def run_tick(
                 agy_runner=agy_runner,
                 log_fn=emit_log,
                 require_existing_ledger=True,
-                project_dir=project_dir,
+                project_dir=_project_for_board(board_dir),
+                thread_id=re_item["thread_id"],
             )
             wake_outcome = {"agent": agent, "uuid": msg_uuid, "outcome": outcome}
-            # Refresh mail_pending.json on APFS if wake produced attention state
             reloaded_wl, _ = wake_routes.WakeLedger.load(
-                runtime_dir / WAKE_LEDGER_NAME,
-                now=clock(),
-                allow_missing=False,
+                runtime_dir / WAKE_LEDGER_NAME, now=clock(), allow_missing=False,
             )
-            att = reloaded_wl.attention_items()
-            if att:
-                high_inc_formatted = [
-                    {
-                        "incident_id": i["item_id"],
-                        "code": i["reason_code"],
-                        "message_id": i["message_id"],
-                        "thread_id": i["thread_id"],
-                    }
-                    for i in mail_digest["items"]
-                    if i["kind"] == "high_incident"
-                ]
-                updated_digest = board_state.build_mail_digest_payload(
-                    snapshot_id=result["snapshot_id"],
-                    as_of=result["as_of"],
-                    open_pending=result["state"]["pending"],
-                    high_incidents=high_inc_formatted,
-                    wake_attention_items=att,
-                )
-                _write_apfs_json(runtime_dir / MAIL_PENDING_NAME, updated_digest)
+            reloaded_registry, _ = wake_routes.RoleRegistry.load(runtime_dir / wake_routes.REGISTRY_NAME)
+            publish_mail_digest(reloaded_wl, reloaded_registry, clock())
             break
 
     return {
@@ -926,6 +931,11 @@ def run_tick(
         "wake_sent": wake_outcome,
         "mail_sent": mail_outcome,
     }
+
+
+def _project_for_board(board_dir: Path) -> Path:
+    parent = Path(board_dir).resolve().parent
+    return parent.parent if parent.name == "bridge" else parent
 
 
 def parse_args(argv=None):
@@ -987,11 +997,16 @@ def main(argv=None) -> int:
 
     if args.command == "probe":
         config, corrupt = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
-        results = {} if corrupt else wake_routes.probe_routes(config)
-        ok = not corrupt and all(route["status"] == "ok" for route in results.values())
+        registry, registry_corrupt = wake_routes.RoleRegistry.load(runtime_dir / wake_routes.REGISTRY_NAME)
+        results = {} if corrupt or registry_corrupt else wake_routes.probe_routes(
+            config, registry, _project_for_board(board_dir),
+        )
+        ok = not (corrupt or registry_corrupt) and all(
+            route["status"] in ("ok", "awaiting_checkin", "stale") for route in results.values()
+        )
         report = {"ok": ok, "routes": results}
-        if corrupt:
-            report["error"] = "invalid_routes"
+        if corrupt or registry_corrupt:
+            report["error"] = "invalid_routes" if corrupt else "invalid_registry"
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if ok else 2
 
