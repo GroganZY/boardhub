@@ -632,11 +632,11 @@ function refreshIndexes() {
 
 function render(keepScroll = false, resetTo = false) {
   topBar();
+  updateComposer(resetTo);
   renderTimeline(keepScroll);
   renderNavigation();
   renderAgents();
   renderDetails();
-  updateComposer(resetTo);
 }
 
 function togglePanel(id, open) {
