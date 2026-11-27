@@ -1013,7 +1013,7 @@ def main(argv=None) -> int:
             config, registry, _project_for_board(board_dir),
         )
         ok = not (corrupt or registry_corrupt) and all(
-            route["status"] in ("ok", "awaiting_checkin", "stale") for route in results.values()
+            route["status"] in ("ok", "inbox_only", "awaiting_checkin", "stale") for route in results.values()
         )
         report = {"ok": ok, "routes": results}
         if corrupt or registry_corrupt:

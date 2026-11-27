@@ -576,9 +576,65 @@ function topBar() {
     el("span", "", "邮件 " + (health.mail === null ? "未知" : (health.mail ? "开启" : "关闭")))
   );
   if (!health.board) $("top-status").append(el("span", "", "看板暂不可用"));
-  $("group-name").textContent = view.group && view.group.name ? view.group.name : "群聊";
+  const name = groupName();
+  $("group-name").textContent = name;
+  $("group-mark").textContent = Array.from(name)[0] || "群";
+  $("group-meta").textContent = "群聊 · " + memberList().length + " 个成员";
+  $("composer-title").textContent = "发到「" + name + "」群";
   $("updated").replaceChildren(offline ? "离线快照 · 更新于 " : "更新于 ", timeNode(view.generated));
   $("updated").lastChild.dataset.relative = "";
+}
+
+function groupName() {
+  return view && view.group && view.group.name ? view.group.name : "群聊";
+}
+
+function renderGroupMenu() {
+  const menu = $("group-menu");
+  const current = button("", "group-option", () => toggleGroupMenu(false));
+  current.setAttribute("role", "menuitemradio");
+  current.setAttribute("aria-checked", "true");
+  current.append(el("span", "group-mark small", Array.from(groupName())[0] || "群"), el("span", "", groupName()), el("span", "check", "✓"));
+  const create = button("＋ 新建群聊（即将支持）", "group-option", null);
+  create.setAttribute("role", "menuitem");
+  create.disabled = true;
+  menu.replaceChildren(el("p", "group-menu-title", "切换群聊"), current, el("hr"), create);
+}
+
+function toggleGroupMenu(open) {
+  const menu = $("group-menu");
+  if (open) renderGroupMenu();
+  menu.hidden = !open;
+  $("group-button").setAttribute("aria-expanded", String(open));
+  if (open) menu.querySelector(".group-option")?.focus();
+}
+
+// What happens to a message for each recipient, from its route status.
+function deliveryNote(id) {
+  if (!id) return "";
+  if (id === "all") return "写入所有成员的收件箱，不会叫醒任何人";
+  const agent = view.agents.find((item) => item.id === id);
+  const route = agent ? agent.route : "";
+  if (route === "ok") {
+    if (id === "gemini") return "会被叫醒并回复";
+    if (id === "codex" || id === "dsh") return "开新会话处理";
+    return "会被实时叫醒";
+  }
+  if (route === "inbox_only" || route === "disabled") return "仅收件箱 · 不会实时收到";
+  if (route === "stale" || route === "awaiting_checkin") return "签到已过期 · 先进收件箱";
+  if (route === "unavailable") return "路由不可用 · 先进收件箱";
+  return "";
+}
+
+function updateDeliveryHint() {
+  const value = composer.elements.to.value;
+  const note = deliveryNote(value);
+  const hint = $("delivery-hint");
+  hint.hidden = !note;
+  hint.replaceChildren();
+  if (!note) return;
+  const live = /叫醒并|开新会话|实时叫醒/.test(note);
+  hint.append(el("span", "dot " + (live ? "live" : "idle")), actorName(value) + "：" + note);
 }
 
 function statusLine(agent) {
@@ -805,12 +861,14 @@ function fillRecipients(select, includeAll, selected, excluded = []) {
   };
   const nodes = [option("", "选择成员")];
   if (includeAll) nodes.push(option("all", "所有成员"));
-  nodes.push(...ids.filter((id) => !LEGACY_ROLES.has(id)).map((id) => option(id, actorName(id))));
+  const labelled = (id, name) => option(id, name + (deliveryNote(id) ? "（" + deliveryNote(id) + "）" : ""));
+  if (includeAll) nodes[nodes.length - 1].textContent = "所有成员（" + deliveryNote("all") + "）";
+  nodes.push(...ids.filter((id) => !LEGACY_ROLES.has(id)).map((id) => labelled(id, actorName(id))));
   const legacy = ids.filter((id) => LEGACY_ROLES.has(id));
   if (legacy.length) {
     const groupNode = el("optgroup");
     groupNode.label = "旧身份";
-    groupNode.append(...legacy.map((id) => option(id, legacyLabels[id] || id)));
+    groupNode.append(...legacy.map((id) => labelled(id, legacyLabels[id] || id)));
     nodes.push(groupNode);
   }
   select.replaceChildren(...nodes);
@@ -965,6 +1023,7 @@ function updateComposer(resetTo = false) {
     fillRecipients(to, !isTask, suggested);
     recipientSignature = signature;
   }
+  updateDeliveryHint();
   composer.querySelector("button[type=submit]").disabled = busy || blocked;
   label.textContent = blocked ? "此话题已暂停或结束，可发送新消息开启新话题。" :
     (isTask ? "将创建一个新的任务话题" : (thread ? "回复到当前话题 · " : "") + "Enter 发送，Shift + Enter 换行");
@@ -1335,9 +1394,9 @@ function renderTimeline(keepScroll = false) {
         .some((value) => String(value || "").toLocaleLowerCase().includes(term));
     });
   } else if (mode === "mainline") {
-    title = "主线";
+    title = "主线 · 你与 Claude 的对话";
     const result = renderMainline(fragment);
-    caption = "你与 Claude Code 的对话" + (result.labels > 1 ? "，main 与 side 按时间合并" : "") + " · " + result.count + " 条";
+    caption = (result.labels > 1 ? "main 与 side 按时间合并 · " : "") + result.count + " 条 · 只读";
     rows = [];
   } else if (mode === "overview") {
     title = "群聊概览";
@@ -1536,8 +1595,19 @@ $("mainline-nav").addEventListener("click", () => {
 });
 $("new-message").addEventListener("click", () => {
   composer.elements.type.value = "info";
-  navigate("overview");
+  if (mode === "mainline" || mode === "queue") navigate("overview");
+  else updateComposer();
+  composer.scrollIntoView({block: "nearest"});
+  composer.classList.remove("spotlight");
+  void composer.offsetWidth;
+  composer.classList.add("spotlight");
   composer.elements.body.focus();
+});
+composer.addEventListener("animationend", () => composer.classList.remove("spotlight"));
+composer.elements.to.addEventListener("change", updateDeliveryHint);
+$("group-button").addEventListener("click", () => toggleGroupMenu($("group-menu").hidden));
+document.addEventListener("click", (event) => {
+  if (!$("group-menu").hidden && !event.target.closest(".group-switcher")) toggleGroupMenu(false);
 });
 search.addEventListener("input", () => {
   if (!view) return;
@@ -1548,6 +1618,11 @@ document.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     search.focus();
+  }
+  if (event.key === "Escape" && !$("group-menu").hidden) {
+    toggleGroupMenu(false);
+    $("group-button").focus();
+    return;
   }
   if (event.key === "Escape") {
     togglePanel("sidebar", false);

@@ -17,6 +17,7 @@ import selectors
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -54,6 +55,16 @@ DEFAULT_STALE_DAYS = 7
 CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
 CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 CLAUDE_BIN = "/usr/local/bin/claude"
+CLAUDE_PEER_SESSIONS = Path.home() / ".claude" / "sessions"
+CLAUDE_PEER_SOCKET_DIRS = tuple(
+    Path(root) / name
+    for root in ("/tmp", "/private/tmp")
+    for name in ("cc-socks", f"cc-socks-{os.getuid()}")
+)
+CLAUDE_PEER_ROLES = frozenset({"claude_main", "claude_side"})
+CLAUDE_DESKTOP_ID_RE = re.compile(r"local_" + board_lint.SESSION_UUID_RE.pattern)
+CLAUDE_PEER_TIMEOUT_SECONDS = 2.0
+CLAUDE_PEER_RECORD_LIMIT = 4096
 DSH_SOCKET = Path.home() / "Library/Application Support/ClaudeTunnelGuard/dsh-mcp.sock"
 GEMINI_SOCKET = Path.home() / "Library/Application Support/ClaudeAgyBroker/agy.sock"
 MAIL_DEFAULT_ENABLED = False
@@ -194,7 +205,8 @@ def validate_route_config(raw_obj: dict) -> dict:
         if not isinstance(cfg, dict) or type(cfg.get("enabled")) is not bool:
             raise RouteConfigError(f"Route for {agent} requires a boolean enabled field.")
         adapter = cfg.get("adapter")
-        if adapter != "inbox" and (agent not in ROUTE_ADAPTERS or adapter != ROUTE_ADAPTERS[agent]):
+        peer_route = adapter == "claude_peer" and agent in CLAUDE_PEER_ROLES
+        if not isinstance(adapter, str) or (not peer_route and adapter not in ("inbox", ROUTE_ADAPTERS.get(agent))):
             raise RouteConfigError(f"Unsupported adapter for {agent}.")
         route = {"adapter": adapter, "enabled": cfg["enabled"]}
         if adapter == "inbox":
@@ -231,9 +243,14 @@ def validate_route_config(raw_obj: dict) -> dict:
                 route["permissionPreset"] = _optional_token(cfg, "permissionPreset")
         elif adapter == "claude":
             route["claude_bin"] = _config_path(cfg.get("claude_bin", CLAUDE_BIN), "claude_bin")
+        elif adapter == "claude_peer":
+            desktop_id = _route_id(cfg, "desktop_session_id", CLAUDE_DESKTOP_ID_RE)
+            if route["enabled"] and desktop_id is None:
+                raise RouteConfigError(f"{agent} requires desktop_session_id when enabled.")
+            route["desktop_session_id"] = desktop_id
         if route.get("mode") == "spawn":
             route["resume_same_thread"] = _boolean(cfg, "resume_same_thread", True)
-        elif adapter != "inbox":
+        elif adapter not in ("inbox", "claude_peer"):
             route["pin"] = _boolean(cfg, "pin", False)
             field = _route_id_field(route)
             route[field] = _route_id(cfg, field, board_lint.SESSION_ID_PATTERNS[adapter])
@@ -353,6 +370,8 @@ class RoleRegistry:
     def resolve(self, role: str, route: dict, now: datetime, stale_days: int) -> Tuple[Optional[dict], str]:
         if route["adapter"] == "inbox":
             return None, "inbox_only"
+        if route["adapter"] == "claude_peer":
+            return (route, "ok") if route["desktop_session_id"] else (None, "inbox_only")
         if route.get("mode") == "spawn":
             return route, "ok"
         field = _route_id_field(route)
@@ -842,6 +861,126 @@ def _run_cli_wake(route: dict, prompt: str, project_dir: Optional[Path], timeout
     return "uncertain", "unexpected_exit_status"
 
 
+def _read_claude_peer_json(path: Path, *, private: bool = False) -> dict:
+    if private:
+        fd = board_lint.verify_regular_file(path)
+    else:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise RouteConfigError("Unsafe Claude peer record.")
+        with os.fdopen(fd, "rb", closefd=False) as file:
+            data = file.read(CLAUDE_PEER_RECORD_LIMIT + 1)
+    finally:
+        os.close(fd)
+    if len(data) > CLAUDE_PEER_RECORD_LIMIT:
+        raise RouteConfigError("Oversized Claude peer record.")
+    obj = json.loads(data)
+    if not isinstance(obj, dict):
+        raise RouteConfigError("Invalid Claude peer record.")
+    return obj
+
+
+def _resolve_claude_peer(desktop_id: str) -> Tuple[Path, int, str, str]:
+    directory = board_lint.verify_runtime_dir(CLAUDE_PEER_SESSIONS)
+    matches = []
+    for path in directory.iterdir():
+        if not re.fullmatch(r"[1-9][0-9]{0,9}\.json", path.name):
+            continue
+        try:
+            record = _read_claude_peer_json(path)
+        except (OSError, ValueError, RouteConfigError):
+            continue
+        if record.get("hostSessionId") == desktop_id:
+            matches.append((int(path.stem), record))
+    if len(matches) != 1:
+        raise RouteConfigError("Claude Desktop session unavailable or ambiguous.")
+
+    pid, record = matches[0]
+    session_id = record.get("sessionId")
+    socket_name = record.get("messagingSocketPath")
+    if (
+        record.get("entrypoint") != "claude-desktop" or record.get("kind") != "interactive"
+        or type(record.get("pid")) is not int or record["pid"] != pid
+        or type(record.get("peerProtocol")) is not int or record["peerProtocol"] != 1
+        or not isinstance(session_id, str) or not SESSION_UUID_RE.fullmatch(session_id)
+        or not isinstance(socket_name, str)
+    ):
+        raise RouteConfigError("Invalid or unsupported Claude Desktop session.")
+    socket_path = Path(socket_name)
+    if (
+        socket_name != str(socket_path) or socket_path.parent not in CLAUDE_PEER_SOCKET_DIRS
+        or not re.fullmatch(rf"{pid}(?:-[0-9a-f]{{8}})?\.sock", socket_path.name)
+    ):
+        raise RouteConfigError("Unexpected Claude peer socket path.")
+    _check_broker_socket(socket_path)
+    board_lint.check_no_allow_acl_path(socket_path.parent)
+
+    # Claude hashes the lexical socket address, including the /tmp spelling on macOS.
+    socket_hash = hashlib.sha256(os.fsencode(socket_path)).hexdigest()
+    key = _read_claude_peer_json(directory / f"{pid}.{socket_hash}.key", private=True)
+    token = key.get("peerToken")
+    if (
+        not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)
+        or any(not isinstance(record.get(field), str) or not record[field] or key.get(field) != record[field]
+               for field in ("procStart", "pidDomain"))
+    ):
+        raise RouteConfigError("Claude peer key does not match the session process.")
+    return socket_path, pid, session_id, token
+
+
+def _claude_peer_pid(connection: socket.socket) -> int:
+    if sys.platform == "darwin":
+        # Darwin sys/un.h defines SOL_LOCAL as 0 and LOCAL_PEERPID as 0x002.
+        return struct.unpack("i", connection.getsockopt(0, 0x002, struct.calcsize("i")))[0]
+    if sys.platform.startswith("linux"):
+        pid, uid, _ = struct.unpack("iII", connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("iII"),
+        ))
+        if uid == os.getuid():
+            return pid
+    raise OSError("Cannot verify Claude peer process.")
+
+
+def _run_claude_peer_wake(route: dict, message_uuid: str, agent: str) -> Tuple[str, str]:
+    deadline = time.monotonic() + CLAUDE_PEER_TIMEOUT_SECONDS
+    try:
+        path, pid, session_id, token = _resolve_claude_peer(route["desktop_session_id"])
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except (OSError, ValueError, RouteConfigError, board_lint.SecurityError):
+        return "not_sent", "claude_peer_unavailable"
+
+    prompt = build_wake_prompt(message_uuid, agent)
+    content = (
+        '<cross-session-message from="boardhub" from-name="BoardHub">\n'
+        f"{prompt}\n</cross-session-message>"
+    )
+    frames = (
+        {"type": "auth", "token": token},
+        {
+            "type": "user", "session_id": session_id, "from": "boardhub", "priority": "later",
+            "message": {"role": "user", "content": content},
+        },
+    )
+    payload = "".join(json.dumps(frame, separators=(",", ":")) + "\n" for frame in frames).encode("utf-8")
+    with connection:
+        try:
+            connection.settimeout(_remaining(deadline))
+            connection.connect(str(path))
+            if _claude_peer_pid(connection) != pid:
+                return "not_sent", "claude_peer_identity_mismatch"
+            connection.settimeout(_remaining(deadline))
+        except OSError:
+            return "not_sent", "claude_peer_unavailable"
+        try:
+            connection.sendall(payload)
+        except OSError:
+            return "uncertain", "claude_peer_write_uncertain"
+    # Protocol 1 provides no in-band acknowledgement of admission to the queue.
+    return "accepted", "accepted"
+
+
 def _probe_socket(path: Path) -> None:
     _check_broker_socket(path)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -860,7 +999,7 @@ def probe_routes(
         adapter = route["adapter"]
         if adapter == "inbox":
             continue
-        _, status = registry.resolve(agent, route, now, config["stale_days"])
+        resolved, status = registry.resolve(agent, route, now, config["stale_days"])
         try:
             if adapter == "gemini_agy":
                 _validate_executable_file(route["agy_client_path"])
@@ -868,11 +1007,14 @@ def probe_routes(
                 _probe_socket(GEMINI_SOCKET)
             elif adapter == "dsh":
                 _probe_socket(Path(route["socket_path"]))
+            elif adapter == "claude_peer":
+                if resolved is not None:
+                    _resolve_claude_peer(resolved["desktop_session_id"])
             else:
                 _trusted_program(route["codex_bin"] if adapter == "codex" else route["claude_bin"])
             if route.get("mode") == "spawn":
                 _spawn_workdir(route, project_dir)
-        except (OSError, RuntimeError, RouteConfigError, board_lint.SecurityError):
+        except (OSError, RuntimeError, ValueError, RouteConfigError, board_lint.SecurityError):
             status = "prerequisite_unavailable"
         results[agent] = {"adapter": adapter, "enabled": route["enabled"], "status": status}
     return results
@@ -1385,6 +1527,8 @@ def wake(
             )
         elif route["adapter"] == "dsh":
             outcome, reason_code = run_dsh_continue(route, prompt, OUTER_DEADLINE_SECONDS)
+        elif route["adapter"] == "claude_peer":
+            outcome, reason_code = _run_claude_peer_wake(route, message_uuid, agent)
         else:
             outcome, reason_code = _run_cli_wake(route, prompt, project_dir, OUTER_DEADLINE_SECONDS)
     except Exception:
@@ -1399,7 +1543,7 @@ def wake(
 
     finish_now = clock()
     ledger.finish_attempt(agent, message_uuid, outcome, reason_code, duration_ms, finish_now)
-    if outcome == "accepted" and spawn is None and not route["pin"] and agent in registry.roles:
+    if outcome == "accepted" and spawn is None and not route.get("pin", True) and agent in registry.roles:
         registry.note_wake(agent, finish_now)
 
     if log_fn is not None:

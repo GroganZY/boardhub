@@ -23,16 +23,14 @@
       "resume_same_thread": true
     },
     "claude_main": {
-      "adapter": "claude",
+      "adapter": "claude_peer",
       "enabled": false,
-      "session_id": null,
-      "claude_bin": "/absolute/path/to/claude"
+      "desktop_session_id": null
     },
     "claude_side": {
-      "adapter": "claude",
+      "adapter": "claude_peer",
       "enabled": false,
-      "session_id": null,
-      "claude_bin": "/absolute/path/to/claude"
+      "desktop_session_id": null
     }
   },
   "mail": {

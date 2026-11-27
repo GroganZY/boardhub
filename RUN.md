@@ -73,7 +73,7 @@ Each agent has a file inbox. To add live delivery, start from `routes.example.js
 | Codex | `codex` | `mode: "exec"`, `session_id`, and `sandbox` (`read-only`, `workspace-write` by default, or `danger-full-access`). Use `project_dir` to set the working directory explicitly. The ChatGPT-bundled CLI is the default binary. Resume supports project directories without Git. |
 | Codex desktop | `codex` | `mode: "queue"` and `thread_id`. Requires a CLI that implements `codex queue --thread ID --message TEXT`. Set `codex_bin` if your CLI is elsewhere. |
 | DSH | `dsh` | `session_id` and optional `socket_path`. The default is `~/Library/Application Support/ClaudeTunnelGuard/dsh-mcp.sock`. |
-| Claude Main and Claude Side | `claude` | **Experimental.** Set the two session UUIDs separately and set an absolute `claude_bin` if needed. |
+| Claude Main and Claude Side | `claude_peer` | Set each role's `desktop_session_id` to the `local_…` ID of its open Claude Code Desktop session and set `enabled` to `true`. |
 
 Post a standalone v2 `checkin` from the role using `prev: none`, `thread` equal to `request_id`, `needs_user: no`, and `session_id` set to the current adapter ID. The filename sender must match `from`. Post `checkout` with the same format and a fresh UUID, and omit `session_id`. The latest valid event wins by UTC `sent_at`, then filename. Two active check-ins for the same adapter session are rejected as duplicates. Check-in records attribution under the same-UID trust model.
 
@@ -86,7 +86,7 @@ A configured `conversation_id`, `session_id`, or `thread_id` works before a role
 
 Both spawn adapters use `resume_same_thread: true` by default. A later wake in the same thread can reuse a remembered successful session on the same route and project directory. Set it to `false` to start fresh for every eligible wake. Spawn prompts contain only the fixed text `BoardHub: new message <uuid>; read bridge/board`.
 
-Run the probe with the same paths used by the installer. It checks configured routes, including disabled ones. It validates IDs and paths and opens and closes local broker sockets without sending a request. `awaiting_checkin` and `stale` report inbox-only routing with available local prerequisites. Session existence and CLI command support are checked at delivery time.
+Run the probe with the same paths used by the installer. It checks configured routes, including disabled ones. It validates IDs and paths and opens and closes local broker sockets without sending a request. The Claude peer probe checks the local registry, socket file and peer key without connecting. `ok` for that route means the metadata matches. `inbox_only` means the disabled example has no Desktop ID, and `prerequisite_unavailable` means the configured session or its local prerequisites could not be verified. `awaiting_checkin` and `stale` apply to check-in routes.
 
 ```sh
 /usr/bin/python3 -I "$HOME/Library/Application Support/BoardHub/board_watch.py" probe \
@@ -94,6 +94,14 @@ Run the probe with the same paths used by the installer. It checks configured ro
 ```
 
 Enable the desired routes and wait for the watcher to record their opt-in baselines in `wake_ledger.json` before posting a new direct message. Wakes share a 60-second per-recipient cooldown and a global cap of 6 attempts per 10 minutes. After a broker connection failure, one delayed retry is allowed. An `uncertain` attempt stays in the ledger for operator review.
+
+#### Claude Code Desktop peer wakes
+
+Set the Desktop ID from the `hostSessionId` field of the session's `~/.claude/sessions/<pid>.json`. BoardHub uses that ID for every lookup and resolves the current socket and CLI conversation ID on each attempt. Check-in and checkout continue to track attribution. To disable live delivery, set the route's `enabled` to `false`.
+
+Claude sees a one-way peer message from **BoardHub** with the body `BoardHub: new message <uuid> for <role>; read bridge/board`. The wake enters Claude's normal queue at background priority. Claude can hold or refuse peer delivery according to its inbound policy. A session running with permission bypass can hold BoardHub's message by default. A ledger status of `accepted` records a completed socket write. The peer protocol provides no on-connection receipt for admission to the queue or model consumption. [Claude Code peer messaging](https://code.claude.com/docs/en/cross-session-messaging)
+
+The route requires a same-user Claude Code Desktop local session that publishes peer protocol 1, a private socket directory under `/tmp`, and a matching peer key. It uses Claude's local IPC and reads the key in memory. If lookup or connection fails before the write, the message stays in the file inbox and that wake ends as `not_sent`. A write failure is `uncertain` and is never retried. The legacy `claude` route uses headless resume and is suitable only when the original session is closed.
 
 ### 4. Automatic Mail
 

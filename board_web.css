@@ -361,7 +361,7 @@ dialog::backdrop { background: #10172488; }
   .sidebar.open { display: flex; }
   #nav-toggle { display: inline-block; }
   .brand { gap: 6px; }
-  .brand-mark, .search kbd, .group-name { display: none; }
+  .brand-mark, .search kbd { display: none; }
   .search input { padding-right: 8px; }
   .conversation-head { min-height: 52px; padding-inline: 12px; }
   .messages { padding-inline: 4px; }
@@ -456,3 +456,45 @@ button.annotation:hover { color: var(--ink-2); border-color: var(--line-strong);
 .annotation-detail .markdown { font-size: 13px; }
 .ml-bubble.compact { padding-bottom: 7px; }
 .ml-bubble.compact .annotations { margin-bottom: 0; }
+
+/* C08: group → views / members → sessions hierarchy */
+.group-switcher { position: relative; flex: none; padding: 10px 8px 8px; border-bottom: 1px solid var(--line); }
+.group-button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 8px; border: 1px solid transparent; border-radius: 8px; background: transparent; text-align: left; }
+.group-button:hover, .group-button[aria-expanded="true"] { background: var(--panel); border-color: var(--line); }
+.group-mark { display: inline-grid; place-items: center; flex: none; width: 30px; height: 30px; border-radius: 8px; background: var(--ink); color: var(--panel); font-size: 14px; font-weight: 700; }
+.group-mark.small { width: 22px; height: 22px; border-radius: 6px; font-size: 11px; }
+.group-text { display: grid; min-width: 0; }
+.group-switcher .group-name { padding: 0; margin: 0; border: 0; color: var(--ink); font-size: 14.5px; font-weight: 700; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.group-text small { color: var(--muted); font-size: 11.5px; }
+.group-caret { margin-left: auto; color: var(--muted); font-size: 11px; }
+.group-menu { position: absolute; left: 8px; right: 8px; top: calc(100% - 4px); z-index: 6; padding: 6px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 12px 32px var(--shadow); }
+.group-menu-title { padding: 4px 8px 6px; color: var(--muted); font-size: 11.5px; font-weight: 600; }
+.group-menu hr { margin: 5px 2px; border: 0; border-top: 1px solid var(--line); }
+.group-option { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 34px; padding: 4px 8px; border: 0; border-radius: 6px; background: transparent; font-size: 13px; text-align: left; }
+.group-option:hover:not(:disabled) { background: var(--hover); }
+.group-option:disabled { color: var(--muted); opacity: 1; }
+.group-option .check { margin-left: auto; color: var(--accent); font-weight: 700; }
+/* Everything under the switcher belongs to the group: sections read as its children. */
+.sidebar-scroll { padding-top: 6px; }
+.nav-section.first { margin-top: 4px; }
+.nav-section h2 { display: flex; align-items: center; gap: 8px; padding: 0 8px 5px; }
+.nav-section h2::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+/* Composer: where messages go */
+.composer-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.composer-title strong { font-size: 13.5px; font-weight: 650; color: var(--ink); }
+.composer-title span { margin-left: auto; color: var(--muted); font-size: 12px; }
+.composer-explainer { margin: 1px 0 7px; color: var(--muted); font-size: 12px; }
+.composer select { max-width: 300px; }
+.delivery-hint { display: flex; align-items: center; gap: 6px; margin-top: 5px; color: var(--ink-2); font-size: 12px; }
+.delivery-hint .dot { flex: none; }
+.composer.spotlight { animation: spotlight 1.4s ease-out; }
+@keyframes spotlight {
+  0% { box-shadow: 0 0 0 0 var(--accent); border-color: var(--accent); }
+  35% { box-shadow: 0 0 0 5px var(--selected); border-color: var(--accent); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+@media (max-width: 610px) {
+  .composer-title span { margin-left: 0; width: 100%; }
+  .composer select { max-width: 100%; }
+}
