@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BoardHub wake routes, APFS wake ledger, Gemini live adapter, and mail digest tracking.
+"""BoardHub wake routes, bounded delivery adapters, and private delivery ledgers.
 
 Python 3.8+ standard library only.
 """
@@ -13,6 +13,7 @@ import pwd
 import re
 import selectors
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -45,7 +46,20 @@ else:
 SCHEMA_VERSION = 2
 RETRY_SEMANTICS_VERSION = 2
 VALID_OUTCOMES = ("accepted", "not_sent", "uncertain", "disabled")
-VALID_ADAPTERS = ("inbox", "gemini_agy")
+ROUTE_ADAPTERS = {
+    "gemini": "gemini_agy",
+    "codex": "codex",
+    "dsh": "dsh",
+    "claude_main": "claude",
+    "claude_side": "claude",
+}
+CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+CLAUDE_BIN = "/usr/local/bin/claude"
+DSH_SOCKET = Path.home() / "Library/Application Support/ClaudeTunnelGuard/dsh-mcp.sock"
+GEMINI_SOCKET = Path.home() / "Library/Application Support/ClaudeAgyBroker/agy.sock"
+MAIL_DEFAULT_ENABLED = False
+PROBE_TIMEOUT_SECONDS = 2.0
 DEFAULT_PYTHON_BIN = os.environ.get("BOARDHUB_PYTHON_BIN", "").strip() or "/usr/bin/python3"
 DEFAULT_AGY_CLIENT = (
     Path(os.environ["BOARDHUB_AGY_CLIENT"]).expanduser()
@@ -65,6 +79,7 @@ def _default_python_bin() -> str:
     return os.environ.get("BOARDHUB_PYTHON_BIN", "").strip() or DEFAULT_PYTHON_BIN
 
 CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+SESSION_UUID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 SAFE_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 
 RECIPIENT_COOLDOWN_SECONDS = 60
@@ -95,95 +110,105 @@ class RouteConfigError(Exception):
     """Raised when APFS route config is invalid or unsafe."""
 
 
-def build_wake_prompt(message_uuid: str) -> str:
-    """Return fixed wake prompt carrying ONLY a validated canonical UUIDv4."""
+def build_wake_prompt(message_uuid: str, agent: str) -> str:
+    """A fixed prompt containing only a canonical UUIDv4 and a known recipient."""
     if not isinstance(message_uuid, str) or not board_lint.UUID_V4_RE.fullmatch(message_uuid):
         raise ValueError("message_uuid must be a canonical lowercase UUIDv4.")
-    return f"New BoardHub message {message_uuid} for you."
+    if agent not in board_lint.VALID_RECIPIENTS:
+        raise ValueError("Invalid wake recipient.")
+    return f"BoardHub: new message {message_uuid} for {agent}; read bridge/board"
 
 
 def default_route_config() -> dict:
-    """Phase 1 default: inbox-only for every recipient, live adapters disabled."""
     return {
         "version": SCHEMA_VERSION,
         "routes": {
             agent: {"adapter": "inbox", "enabled": False}
             for agent in sorted(board_lint.VALID_SENDERS)
         },
+        "mail": {"enabled": MAIL_DEFAULT_ENABLED, "notifier_path": None},
     }
 
 
+def _config_path(value, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not os.path.isabs(value)
+        or any(ch in SHELL_META_CHARS for ch in value)
+        or board_lint.has_disallowed_control_chars(value)
+    ):
+        raise RouteConfigError(f"{field} must be a clean absolute path.")
+    return value
+
+
+def _route_id(cfg: dict, field: str, pattern) -> Optional[str]:
+    value = cfg.get(field)
+    if value is None and not cfg["enabled"]:
+        return None
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise RouteConfigError(f"Invalid or missing {field}.")
+    return value
+
+
 def validate_route_config(raw_obj: dict) -> dict:
-    """Strictly validate route config without allowing shell commands or templates."""
-    if not isinstance(raw_obj, dict):
-        raise RouteConfigError("Route config must be a JSON object.")
-    if raw_obj.get("version") != SCHEMA_VERSION:
-        raise RouteConfigError("Route config version must be 2.")
-    allowed_top = {"version", "routes"}
-    if set(raw_obj.keys()) - allowed_top or "routes" not in raw_obj:
+    """Strictly validate private routes without accepting shell commands or templates."""
+    if not isinstance(raw_obj, dict) or raw_obj.get("version") != SCHEMA_VERSION:
+        raise RouteConfigError("Route config must be a JSON object with version 2.")
+    if set(raw_obj) - {"version", "routes", "mail"} or not isinstance(raw_obj.get("routes"), dict):
         raise RouteConfigError("Unexpected or missing top-level keys in route config.")
 
-    routes_in = raw_obj["routes"]
-    if not isinstance(routes_in, dict):
-        raise RouteConfigError("routes must be an object.")
-
-    normalized_routes: Dict[str, dict] = {}
-    for agent in sorted(board_lint.VALID_SENDERS):
-        normalized_routes[agent] = {"adapter": "inbox", "enabled": False}
-
-    for agent, cfg in routes_in.items():
-        if agent not in board_lint.VALID_SENDERS:
-            raise RouteConfigError(f"Unknown or recipient-only agent in routes: {agent}")
-        if not isinstance(cfg, dict):
-            raise RouteConfigError(f"Route entry for {agent} must be an object.")
+    result = default_route_config()
+    for agent, cfg in raw_obj["routes"].items():
+        if agent not in result["routes"]:
+            raise RouteConfigError("Unknown route recipient.")
+        if not isinstance(cfg, dict) or type(cfg.get("enabled")) is not bool:
+            raise RouteConfigError(f"Route for {agent} requires a boolean enabled field.")
         adapter = cfg.get("adapter")
-        if adapter not in VALID_ADAPTERS:
-            raise RouteConfigError(f"Unsupported adapter for {agent}: {adapter}")
-        enabled = cfg.get("enabled")
-        if type(enabled) is not bool:
-            raise RouteConfigError(f"enabled for {agent} must be a boolean.")
-
+        if adapter != "inbox" and (agent not in ROUTE_ADAPTERS or adapter != ROUTE_ADAPTERS[agent]):
+            raise RouteConfigError(f"Unsupported adapter for {agent}.")
+        route = {"adapter": adapter, "enabled": cfg["enabled"]}
         if adapter == "inbox":
-            if set(cfg.keys()) - {"adapter", "enabled"}:
-                raise RouteConfigError(f"Unexpected fields in inbox route for {agent}.")
-            normalized_routes[agent] = {"adapter": "inbox", "enabled": False}
-            continue
+            route["enabled"] = False
+        elif adapter == "gemini_agy":
+            route["conversation_id"] = _route_id(cfg, "conversation_id", CONVERSATION_ID_RE)
+            route["agy_client_path"] = _config_path(cfg.get("agy_client_path", _default_agy_client()), "agy_client_path")
+            route["python_bin"] = _config_path(cfg.get("python_bin", _default_python_bin()), "python_bin")
+        elif adapter == "codex":
+            mode = cfg.get("mode", "exec")
+            if mode not in ("exec", "queue"):
+                raise RouteConfigError("Codex mode must be exec or queue.")
+            route["mode"] = mode
+            route["codex_bin"] = _config_path(cfg.get("codex_bin", CODEX_BIN), "codex_bin")
+            workdir = cfg.get("project_dir")
+            route["project_dir"] = _config_path(workdir, "project_dir") if workdir is not None else None
+            if mode == "exec":
+                route["session_id"] = _route_id(cfg, "session_id", SESSION_UUID_RE)
+                sandbox = cfg.get("sandbox", "workspace-write")
+                if sandbox not in CODEX_SANDBOXES:
+                    raise RouteConfigError("Invalid Codex sandbox.")
+                route["sandbox"] = sandbox
+            else:
+                route["thread_id"] = _route_id(cfg, "thread_id", SESSION_UUID_RE)
+        elif adapter == "dsh":
+            route["session_id"] = _route_id(cfg, "session_id", CONVERSATION_ID_RE)
+            route["socket_path"] = _config_path(cfg.get("socket_path", str(DSH_SOCKET)), "socket_path")
+        elif adapter == "claude":
+            route["session_id"] = _route_id(cfg, "session_id", SESSION_UUID_RE)
+            route["claude_bin"] = _config_path(cfg.get("claude_bin", CLAUDE_BIN), "claude_bin")
+        if set(cfg) - set(route):
+            raise RouteConfigError(f"Unexpected fields in {agent} route.")
+        result["routes"][agent] = route
 
-        # gemini_agy adapter (Phase 1 ONLY allows Gemini live route)
-        if agent != "gemini":
-            raise RouteConfigError("Phase 1 live adapter gemini_agy is allowed ONLY for gemini.")
-        allowed_keys = {"adapter", "enabled", "conversation_id", "agy_client_path", "python_bin"}
-        if set(cfg.keys()) - allowed_keys:
-            raise RouteConfigError("Unexpected fields in gemini_agy route config.")
-
-        conv_id = cfg.get("conversation_id")
-        if conv_id is not None:
-            if not isinstance(conv_id, str) or not CONVERSATION_ID_RE.fullmatch(conv_id):
-                raise RouteConfigError("Invalid gemini conversation_id.")
-        if enabled and not conv_id:
-            raise RouteConfigError("Enabled gemini_agy route requires conversation_id.")
-
-        client_path_str = cfg.get("agy_client_path", _default_agy_client())
-        python_bin_str = cfg.get("python_bin", _default_python_bin())
-        for path_label, path_val in (("agy_client_path", client_path_str), ("python_bin", python_bin_str)):
-            if (
-                not isinstance(path_val, str)
-                or not path_val
-                or not os.path.isabs(path_val)
-                or any(ch in SHELL_META_CHARS for ch in path_val)
-                or board_lint.has_disallowed_control_chars(path_val)
-            ):
-                raise RouteConfigError(f"Invalid {path_label} in route config.")
-
-        normalized_routes[agent] = {
-            "adapter": "gemini_agy",
-            "enabled": enabled,
-            "conversation_id": conv_id,
-            "agy_client_path": client_path_str,
-            "python_bin": python_bin_str,
-        }
-
-    return {"version": SCHEMA_VERSION, "routes": normalized_routes}
+    mail = raw_obj.get("mail", result["mail"])
+    if not isinstance(mail, dict) or set(mail) - {"enabled", "notifier_path"} or type(mail.get("enabled")) is not bool:
+        raise RouteConfigError("mail requires a boolean enabled field and accepts an optional notifier_path.")
+    notifier_path = mail.get("notifier_path")
+    if notifier_path is not None:
+        notifier_path = _config_path(notifier_path, "notifier_path")
+    if mail["enabled"] and notifier_path is None and not MAIL_DEFAULT_ENABLED:
+        raise RouteConfigError("Enabled mail requires notifier_path.")
+    result["mail"] = {"enabled": mail["enabled"], "notifier_path": notifier_path}
+    return result
 
 
 def load_route_config(path: Path) -> Tuple[dict, bool]:
@@ -225,30 +250,10 @@ def _minimal_child_env(home_dir: Optional[Path] = None) -> Dict[str, str]:
     return env
 
 
-def run_agy_client_send(
-    conversation_id: str,
-    prompt: str,
-    agy_client_path: str = str(DEFAULT_AGY_CLIENT),
-    python_bin: str = DEFAULT_PYTHON_BIN,
-    timeout: float = OUTER_DEADLINE_SECONDS,
-    home_dir: Optional[Path] = None,
-) -> Tuple[str, str]:
-    """Invoke agy_client.py send with argv, shell=False, bounded output, 50s outer deadline.
-
-    Returns (outcome, reason_code).
-    """
-    if not CONVERSATION_ID_RE.fullmatch(conversation_id):
-        return "not_sent", "invalid_config"
-
-    try:
-        _validate_executable_file(agy_client_path, allow_owner_exec=True)
-        py_path = Path(python_bin)
-        if not py_path.is_absolute() or not os.access(str(py_path), os.X_OK):
-            return "not_sent", "invalid_config"
-    except (board_lint.SecurityError, RouteConfigError, OSError):
-        return "not_sent", "invalid_config"
-
-    argv = [str(py_path), "-I", str(agy_client_path), "send", conversation_id, prompt]
+def _run_bounded(
+    argv: List[str], timeout: float, home_dir: Optional[Path] = None, cwd: Optional[Path] = None,
+) -> Tuple[Optional[int], bytes, Optional[str]]:
+    """Run without a shell, draining each pipe to a fixed cap and killing the group on failure."""
     env = _minimal_child_env(home_dir=home_dir)
 
     try:
@@ -256,13 +261,14 @@ def run_agy_client_send(
             argv,
             shell=False,
             env=env,
+            cwd=cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
     except OSError:
-        return "not_sent", "client_start_failed"
+        return None, b"", "client_start_failed"
 
     stdout_buf = bytearray()
     stderr_buf = bytearray()
@@ -301,19 +307,19 @@ def run_agy_client_send(
                     break
 
         if timed_out:
-            return "uncertain", "outer_timeout"
+            return None, b"", "outer_timeout"
         if overflow:
-            return "uncertain", "output_limit_exceeded"
+            return None, b"", "output_limit_exceeded"
 
         remaining_time = deadline - time.monotonic()
         if remaining_time <= 0:
-            return "uncertain", "outer_timeout"
+            return None, b"", "outer_timeout"
         returncode = child.wait(timeout=remaining_time)
         completed = True
     except subprocess.TimeoutExpired:
-        return "uncertain", "outer_timeout"
+        return None, b"", "outer_timeout"
     except OSError:
-        return "uncertain", "client_io_failed"
+        return None, b"", "client_io_failed"
     finally:
         if not completed:
             with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
@@ -328,9 +334,44 @@ def run_agy_client_send(
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 child.wait(timeout=1)
 
+    return returncode, bytes(stdout_buf), None
+
+
+def _child_failure(failure: str) -> Tuple[str, str]:
+    return ("not_sent" if failure == "client_start_failed" else "uncertain"), failure
+
+
+def run_agy_client_send(
+    conversation_id: str,
+    prompt: str,
+    agy_client_path: str = str(DEFAULT_AGY_CLIENT),
+    python_bin: str = DEFAULT_PYTHON_BIN,
+    timeout: float = OUTER_DEADLINE_SECONDS,
+    home_dir: Optional[Path] = None,
+) -> Tuple[str, str]:
+    """Invoke agy_client.py send with argv, shell=False, bounded output, 50s outer deadline.
+
+    Returns (outcome, reason_code).
+    """
+    if not CONVERSATION_ID_RE.fullmatch(conversation_id):
+        return "not_sent", "invalid_config"
+
+    try:
+        _validate_executable_file(agy_client_path, allow_owner_exec=True)
+        py_path = Path(python_bin)
+        if not py_path.is_absolute() or not os.access(str(py_path), os.X_OK):
+            return "not_sent", "invalid_config"
+    except (board_lint.SecurityError, RouteConfigError, OSError):
+        return "not_sent", "invalid_config"
+
+    argv = [str(py_path), "-I", str(agy_client_path), "send", conversation_id, prompt]
+    returncode, stdout, failure = _run_bounded(argv, timeout, home_dir=home_dir)
+    if failure:
+        return _child_failure(failure)
+
     try:
         reply = board_lint.decode_json_strict(
-            bytes(stdout_buf).strip(),
+            stdout.strip(),
             max_bytes=MAX_CLIENT_OUTPUT_BYTES,
             max_depth=12,
         )
@@ -355,6 +396,173 @@ def run_agy_client_send(
         return "uncertain", err_code
 
     return "uncertain", "unexpected_exit_status"
+
+
+def _trusted_program(path: str, executable: bool = True) -> Path:
+    """Accept operator-selected user or system programs, including symlinked CLIs."""
+    resolved = Path(path).resolve(strict=True)
+    info = resolved.stat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid not in (0, os.getuid())
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or not os.access(resolved, os.X_OK if executable else os.R_OK)
+    ):
+        raise OSError("Unsafe or inaccessible program.")
+    # A launcher may use argv[0] to find resources relative to the original path.
+    return Path(path)
+
+
+def _check_broker_socket(path: Path) -> None:
+    parent = path.parent.lstat()
+    info = path.lstat()
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+        or not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != os.getuid()
+    ):
+        raise RouteConfigError("Unsafe broker socket.")
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("broker deadline")
+    return remaining
+
+
+def _read_dsh_reply(connection, deadline: float) -> bytes:
+    reply = bytearray()
+    while len(reply) <= MAX_CLIENT_OUTPUT_BYTES:
+        connection.settimeout(_remaining(deadline))
+        chunk = connection.recv(min(65536, MAX_CLIENT_OUTPUT_BYTES + 1 - len(reply)))
+        if not chunk:
+            break
+        reply.extend(chunk)
+        if b"\n" in chunk:
+            if reply.endswith(b"\n") and reply.count(b"\n") == 1:
+                return bytes(reply[:-1])
+            break
+    raise ValueError("Invalid or oversized broker frame.")
+
+
+def run_dsh_continue(route: dict, prompt: str, timeout: float) -> Tuple[str, str]:
+    """Send one newline-delimited JSON-RPC request through the local DSH broker."""
+    deadline = time.monotonic() + timeout
+    path = Path(route["socket_path"])
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "dsh_continue_session",
+            "arguments": {"sessionId": route["session_id"], "prompt": prompt, "wait": False},
+        },
+    }
+    wire = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+    try:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError:
+        return "not_sent", "client_start_failed"
+    with connection:
+        try:
+            _check_broker_socket(path)
+            connection.settimeout(_remaining(deadline))
+            connection.connect(str(path))
+        except RouteConfigError:
+            return "not_sent", "unsafe_socket"
+        except OSError:
+            return "not_sent", "broker_unavailable"
+        try:
+            connection.settimeout(_remaining(deadline))
+            connection.sendall(wire)
+            envelope = board_lint.decode_json_strict(
+                _read_dsh_reply(connection, deadline), max_bytes=MAX_CLIENT_OUTPUT_BYTES, max_depth=12,
+            )
+        except (OSError, ValueError, board_lint.FormatError):
+            return "uncertain", "broker_exchange_failed"
+    response = envelope.get("response") if isinstance(envelope, dict) and envelope.get("ok") is True else None
+    if (
+        not isinstance(response, dict)
+        or response.get("jsonrpc") != "2.0"
+        or type(response.get("id")) is not int
+        or response["id"] != request["id"]
+        or "error" in response
+    ):
+        return "uncertain", "broker_rejected_or_invalid_reply"
+    result = response.get("result")
+    if (
+        not isinstance(result, dict)
+        or result.get("isError", False) is not False
+        or not (isinstance(result.get("content"), list) or isinstance(result.get("structuredContent"), dict))
+    ):
+        return "uncertain", "broker_rejected_or_invalid_reply"
+    return "accepted", "accepted"
+
+
+def _run_cli_wake(route: dict, prompt: str, project_dir: Optional[Path], timeout: float) -> Tuple[str, str]:
+    try:
+        if route["adapter"] == "codex":
+            if route["project_dir"] is not None:
+                project_dir = Path(route["project_dir"])
+            binary = str(_trusted_program(route["codex_bin"]))
+            if route["mode"] == "exec":
+                if project_dir is None:
+                    return "not_sent", "invalid_config"
+                argv = [binary, "exec", "-C", str(project_dir), "--sandbox", route["sandbox"],
+                        "resume", "--skip-git-repo-check", route["session_id"], prompt]
+            else:
+                argv = [binary, "queue", "--thread", route["thread_id"], "--message", prompt]
+        else:
+            # EXPERIMENTAL: headless Claude resume. File inboxes remain available.
+            binary = str(_trusted_program(route["claude_bin"]))
+            argv = [binary, "-p", "--resume", route["session_id"], prompt]
+    except (OSError, RuntimeError):
+        return "not_sent", "invalid_config"
+
+    returncode, _stdout, failure = _run_bounded(argv, timeout, cwd=project_dir)
+    if failure:
+        return _child_failure(failure)
+    if returncode == 0:
+        return "accepted", "accepted"
+    return "uncertain", "unexpected_exit_status"
+
+
+def _probe_socket(path: Path) -> None:
+    _check_broker_socket(path)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(PROBE_TIMEOUT_SECONDS)
+        connection.connect(str(path))
+
+
+def probe_routes(config: dict) -> dict:
+    """Check configured wake route prerequisites locally. Do not spawn or write to sockets."""
+    results = {}
+    for agent, route in sorted(config["routes"].items()):
+        adapter = route["adapter"]
+        if adapter == "inbox":
+            continue
+        status = "ok"
+        id_field = {"gemini_agy": "conversation_id", "dsh": "session_id", "claude": "session_id",
+                    "codex": "thread_id" if route.get("mode") == "queue" else "session_id"}[adapter]
+        if route[id_field] is None:
+            status = "missing_id"
+        else:
+            try:
+                if adapter == "gemini_agy":
+                    _validate_executable_file(route["agy_client_path"])
+                    _trusted_program(route["python_bin"])
+                    _probe_socket(GEMINI_SOCKET)
+                elif adapter == "dsh":
+                    _probe_socket(Path(route["socket_path"]))
+                else:
+                    _trusted_program(route["codex_bin"] if adapter == "codex" else route["claude_bin"])
+            except (OSError, RuntimeError, RouteConfigError, board_lint.SecurityError):
+                status = "prerequisite_unavailable"
+        results[agent] = {"adapter": adapter, "enabled": route["enabled"], "status": status}
+    return results
 
 
 # --- APFS Wake Ledger ---
@@ -656,6 +864,7 @@ def wake(
     agy_runner: Optional[Callable[..., Tuple[str, str]]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
     require_existing_ledger: Optional[bool] = None,
+    project_dir: Optional[Path] = None,
 ) -> str:
     """Dispatch a single validated wake notification according to APFS route config & ledger.
 
@@ -663,7 +872,7 @@ def wake(
     """
     if agent not in board_lint.VALID_RECIPIENTS:
         raise ValueError(f"Invalid wake recipient: {agent}")
-    prompt = build_wake_prompt(message_uuid)
+    prompt = build_wake_prompt(message_uuid, agent)
     if agent == "all":
         return "disabled"
 
@@ -692,49 +901,54 @@ def wake(
         # Disabled route creates NO attempt in ledger
         return "disabled"
 
-    ledger: Optional[WakeLedger] = None
-    if runtime_dir is not None:
-        rdir = Path(runtime_dir)
-        ledger_path = rdir / "wake_ledger.json"
-        if require_existing_ledger is None:
-            allow_missing = not is_wake_ledger_initialized(rdir)
-        else:
-            allow_missing = not require_existing_ledger
-        ledger, ledger_corrupt = WakeLedger.load(ledger_path, now=now, allow_missing=allow_missing)
-        if ledger_corrupt:
-            if log_fn is not None:
-                log_fn(
-                    f"ts={board_lint.format_utc_rfc3339(now)} route={route['adapter']} "
-                    f"agent={agent} uuid={message_uuid} status=not_sent code=wake_ledger_missing_or_corrupt duration_ms=0"
-                )
-            return "not_sent"
-        if not ledger.is_eligible(agent, message_uuid, now):
-            rec = ledger.get_record(agent, message_uuid)
-            if rec and rec.get("status") in ("accepted", "not_sent", "uncertain"):
-                return rec["status"]
-            return "disabled"
-        limit_reason = ledger.check_rate_limit(agent, now)
-        if limit_reason is not None:
-            if log_fn is not None:
-                log_fn(
-                    f"ts={board_lint.format_utc_rfc3339(now)} route={route['adapter']} "
-                    f"agent={agent} uuid={message_uuid} status=rate_limited code={limit_reason} duration_ms=0"
-                )
-            return "not_sent"
+    if runtime_dir is None:
+        return "not_sent"
 
-    if ledger is not None:
-        ledger.begin_attempt(agent, message_uuid, now)
+    rdir = Path(runtime_dir)
+    ledger_path = rdir / "wake_ledger.json"
+    if require_existing_ledger is None:
+        allow_missing = not is_wake_ledger_initialized(rdir)
+    else:
+        allow_missing = not require_existing_ledger
+    ledger, ledger_corrupt = WakeLedger.load(ledger_path, now=now, allow_missing=allow_missing)
+    if ledger_corrupt:
+        if log_fn is not None:
+            log_fn(
+                f"ts={board_lint.format_utc_rfc3339(now)} route={route['adapter']} "
+                f"agent={agent} uuid={message_uuid} status=not_sent code=wake_ledger_missing_or_corrupt duration_ms=0"
+            )
+        return "not_sent"
+    if not ledger.is_eligible(agent, message_uuid, now):
+        rec = ledger.get_record(agent, message_uuid)
+        if rec and rec.get("status") in ("accepted", "not_sent", "uncertain"):
+            return rec["status"]
+        return "disabled"
+    limit_reason = ledger.check_rate_limit(agent, now)
+    if limit_reason is not None:
+        if log_fn is not None:
+            log_fn(
+                f"ts={board_lint.format_utc_rfc3339(now)} route={route['adapter']} "
+                f"agent={agent} uuid={message_uuid} status=rate_limited code={limit_reason} duration_ms=0"
+            )
+        return "not_sent"
+
+    ledger.begin_attempt(agent, message_uuid, now)
 
     t0 = time.monotonic()
-    runner = agy_runner or run_agy_client_send
     try:
-        outcome, reason_code = runner(
-            conversation_id=route["conversation_id"],
-            prompt=prompt,
-            agy_client_path=route["agy_client_path"],
-            python_bin=route["python_bin"],
-            timeout=OUTER_DEADLINE_SECONDS,
-        )
+        if route["adapter"] == "gemini_agy":
+            runner = agy_runner or run_agy_client_send
+            outcome, reason_code = runner(
+                conversation_id=route["conversation_id"],
+                prompt=prompt,
+                agy_client_path=route["agy_client_path"],
+                python_bin=route["python_bin"],
+                timeout=OUTER_DEADLINE_SECONDS,
+            )
+        elif route["adapter"] == "dsh":
+            outcome, reason_code = run_dsh_continue(route, prompt, OUTER_DEADLINE_SECONDS)
+        else:
+            outcome, reason_code = _run_cli_wake(route, prompt, project_dir, OUTER_DEADLINE_SECONDS)
     except Exception:
         outcome, reason_code = "uncertain", "adapter_exception"
     duration_ms = max(0, int((time.monotonic() - t0) * 1000))
@@ -746,8 +960,7 @@ def wake(
         reason_code = "unknown_code"
 
     finish_now = clock()
-    if ledger is not None:
-        ledger.finish_attempt(agent, message_uuid, outcome, reason_code, duration_ms, finish_now)
+    ledger.finish_attempt(agent, message_uuid, outcome, reason_code, duration_ms, finish_now)
 
     if log_fn is not None:
         log_fn(
@@ -758,31 +971,47 @@ def wake(
     return outcome
 
 
-# --- APFS Mail Ledger for dedicated mail-only DSH session ---
+# --- APFS Mail Ledger ---
 
 class MailLedger:
-    """Tracks external mail-session digest submissions in runtime state (never sends mail itself)."""
+    """Track automatic and legacy mail submissions in private runtime state."""
 
     def __init__(self, path: Path, state: dict):
         self.path = Path(path)
         self.state = state
 
     @classmethod
-    def load(cls, path: Path, now: Optional[datetime] = None) -> Tuple["MailLedger", bool]:
+    def load(
+        cls, path: Path, now: Optional[datetime] = None, allow_missing: bool = True,
+    ) -> Tuple["MailLedger", bool]:
         path = Path(path)
         try:
             obj = board_lint.read_private_json_file(path)
         except (board_lint.SecurityError, board_lint.FormatError, OSError):
             return cls(path, {"version": SCHEMA_VERSION, "submissions": []}), True
         if obj is None:
-            return cls(path, {"version": SCHEMA_VERSION, "submissions": []}), False
+            return cls(path, {"version": SCHEMA_VERSION, "submissions": []}), not allow_missing
         if obj.get("version") != SCHEMA_VERSION or not isinstance(obj.get("submissions"), list):
+            return cls(path, {"version": SCHEMA_VERSION, "submissions": []}), True
+
+        auto = obj.get("auto")
+        if "auto" in obj and (
+            not isinstance(auto, dict)
+            or type(auto.get("enabled")) is not bool
+            or not isinstance(auto.get("baseline"), list)
+            or any(not isinstance(item_id, str) for item_id in auto["baseline"])
+        ):
             return cls(path, {"version": SCHEMA_VERSION, "submissions": []}), True
 
         now_str = board_lint.format_utc_rfc3339(now or datetime.now(timezone.utc))
         dirty = False
         for rec in obj["submissions"]:
-            if not isinstance(rec, dict):
+            if (
+                not isinstance(rec, dict)
+                or rec.get("status") not in ("attempting", "sent", "not_sent", "uncertain")
+                or not isinstance(rec.get("item_ids"), list)
+                or any(not isinstance(item_id, str) for item_id in rec["item_ids"])
+            ):
                 return cls(path, {"version": SCHEMA_VERSION, "submissions": []}), True
             if rec.get("status") == "attempting":
                 rec["status"] = "uncertain"
@@ -798,7 +1027,37 @@ class MailLedger:
         payload = (json.dumps(self.state, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
         board_lint.atomic_write_private_file(self.path, payload, mode=0o600)
 
-    def begin_submission(self, item_ids: List[str], snapshot_id: str, now: Optional[datetime] = None) -> str:
+    def sync_auto_baseline(self, enabled: bool, items: List[dict]) -> None:
+        """On opt-in, baseline current alerts so installation and re-enable stay quiet."""
+        previous = self.state.get("auto", {})
+        if previous.get("enabled") is enabled:
+            return
+        self.state["auto"] = {
+            "enabled": enabled,
+            "baseline": sorted({item["item_id"] for item in items}) if enabled else [],
+        }
+        self.save()
+
+    def next_auto_item(self, items: List[dict], now: datetime) -> Optional[dict]:
+        attempted = set(self.state["auto"]["baseline"])
+        jst = timezone(timedelta(hours=9))
+        day_start = now.astimezone(jst).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_count = 0
+        for submission in self.state["submissions"]:
+            if submission.get("automatic") or submission["status"] != "not_sent":
+                attempted.update(submission["item_ids"])
+            if submission.get("automatic"):
+                started = board_lint.parse_utc_rfc3339(submission.get("started_at", ""))
+                if started is not None and started >= day_start:
+                    today_count += 1
+        # The notifier independently enforces its own shared quotas, including external sends.
+        if today_count >= MAIL_DAILY_ATTEMPT_CAP:
+            return None
+        return next((item for item in items if item["item_id"] not in attempted), None)
+
+    def begin_submission(
+        self, item_ids: List[str], snapshot_id: str, now: Optional[datetime] = None, *, automatic: bool = False,
+    ) -> str:
         if not item_ids or any(not isinstance(i, str) or not i for i in item_ids):
             raise ValueError("item_ids must be a nonempty list of IDs.")
         now_dt = now or datetime.now(timezone.utc)
@@ -811,6 +1070,7 @@ class MailLedger:
             "status": "attempting",
             "started_at": now_str,
             "finished_at": None,
+            "automatic": automatic,
         })
         self.save()
         return sub_id
@@ -829,3 +1089,48 @@ class MailLedger:
                 self.save()
                 return
         raise KeyError(f"Unknown mail submission_id: {submission_id}")
+
+
+MAIL_DAILY_ATTEMPT_CAP = 20
+MAIL_TITLES = {
+    "needs_user": "Human review requested",
+    "loop_breaker_30": "Thread paused at 30 messages",
+}
+
+
+def automatic_mail_items(digest: dict) -> List[dict]:
+    return [
+        item for item in digest["items"]
+        if item["kind"] == "high_incident"
+        or (item["kind"] == "pending" and item["reason_code"] in MAIL_TITLES)
+    ]
+
+
+def run_mail_notifier(path: Path, item: dict, timeout: float = OUTER_DEADLINE_SECONDS) -> Tuple[str, str]:
+    """Call the notifier with fixed titles and validated board metadata only."""
+    try:
+        notifier = _trusted_program(str(path), executable=False)
+    except (OSError, RuntimeError):
+        return "not_sent", "notifier_unavailable"
+    title = MAIL_TITLES.get(item["reason_code"], "High-severity lint error")
+    message_uuid = item.get("message_id")
+    thread_uuid = item.get("thread_id")
+    message_id = message_uuid if isinstance(message_uuid, str) and board_lint.UUID_V4_RE.fullmatch(message_uuid) else "none"
+    thread_id = thread_uuid if isinstance(thread_uuid, str) and board_lint.UUID_V4_RE.fullmatch(thread_uuid) else "none"
+    reference = message_id if message_id != "none" else thread_id
+    if item["kind"] == "high_incident":
+        incident_tag = item["item_id"].rsplit(":", 1)[-1]
+        if re.fullmatch(r"[0-9a-f]{12}", incident_tag):
+            reference = incident_tag
+    subject = f"BoardHub: {title} [{reference}]"
+    body = f"Title: {title}\nMessage ID: {message_id}\nThread: {thread_id}\n"
+    returncode, _stdout, failure = _run_bounded(
+        ["/usr/bin/python3", "-B", "-I", str(notifier), "--subject", subject, "--body", body],
+        timeout,
+    )
+    if failure:
+        return _child_failure(failure)
+    if returncode == 0:
+        return "sent", "sent"
+    # Exit 1 can mean a quota rejection or an ambiguous SMTP failure.
+    return "uncertain", "notifier_exit_failed"

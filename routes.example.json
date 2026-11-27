@@ -1,0 +1,39 @@
+{
+  "version": 2,
+  "routes": {
+    "gemini": {
+      "adapter": "gemini_agy",
+      "enabled": false,
+      "conversation_id": null,
+      "agy_client_path": "/absolute/path/to/agy_client.py"
+    },
+    "codex": {
+      "adapter": "codex",
+      "enabled": false,
+      "mode": "exec",
+      "session_id": null,
+      "sandbox": "workspace-write"
+    },
+    "dsh": {
+      "adapter": "dsh",
+      "enabled": false,
+      "session_id": null
+    },
+    "claude_main": {
+      "adapter": "claude",
+      "enabled": false,
+      "session_id": null,
+      "claude_bin": "/absolute/path/to/claude"
+    },
+    "claude_side": {
+      "adapter": "claude",
+      "enabled": false,
+      "session_id": null,
+      "claude_bin": "/absolute/path/to/claude"
+    }
+  },
+  "mail": {
+    "enabled": false,
+    "notifier_path": "/absolute/path/to/notify_mail.py"
+  }
+}

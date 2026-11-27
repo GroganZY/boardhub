@@ -373,7 +373,9 @@ def bootstrap_runtime(
     if wake_corrupt:
         raise WatcherError("Wake ledger is corrupt or missing during bootstrap.")
 
-    mail_ledger, mail_corrupt = wake_routes.MailLedger.load(runtime_dir / MAIL_LEDGER_NAME, now=now)
+    mail_ledger, mail_corrupt = wake_routes.MailLedger.load(
+        runtime_dir / MAIL_LEDGER_NAME, now=now, allow_missing=not already_init,
+    )
     if mail_corrupt:
         raise WatcherError("Mail ledger is corrupt during bootstrap.")
 
@@ -397,8 +399,10 @@ def bootstrap_runtime(
     health_rec["snapshot_id"] = result["snapshot_id"]
     health_rec["bootstrapped"] = True
 
-    # 2. Write ledgers BEFORE baseline & manifest so crash recovery never strands manifest without wake_ledger
-    mail_ledger.save()
+    # Write ledgers before the baseline and manifest so interrupted bootstrap can resume.
+    mail_ledger.sync_auto_baseline(
+        route_cfg["mail"]["enabled"], wake_routes.automatic_mail_items(result["mail_pending"]),
+    )
     wake_ledger.sync_route_baselines(route_cfg, baseline_uuids, now)
     wake_ledger.save()
     if _after_wake_save_hook is not None:
@@ -472,6 +476,28 @@ def reconcile_runtime_manifest(
     return result
 
 
+def _send_next_mail(
+    board_dir: Path, ledger: wake_routes.MailLedger, settings: dict, digest: dict,
+    clock: Callable[[], datetime], emit_log: Callable[[str], None],
+) -> Optional[dict]:
+    items = wake_routes.automatic_mail_items(digest)
+    ledger.sync_auto_baseline(settings["enabled"], items)
+    if not settings["enabled"]:
+        return None
+    now = clock()
+    item = ledger.next_auto_item(items, now)
+    if item is None:
+        return None
+
+    path = settings["notifier_path"]
+    notifier = Path(path) if path else Path(board_dir).parent / "notify" / "notify_mail.py"
+    submission_id = ledger.begin_submission([item["item_id"]], digest["snapshot_id"], now=now, automatic=True)
+    status, code = wake_routes.run_mail_notifier(notifier, item)
+    ledger.finish_submission(submission_id, status, now=clock())
+    emit_log(f"ts={digest['as_of']} route=mail item={item['item_id']} status={status} code={code}")
+    return {"item_id": item["item_id"], "outcome": status}
+
+
 def run_tick(
     board_dir: Path,
     runtime_dir: Path,
@@ -480,8 +506,11 @@ def run_tick(
     log_fn: Optional[Callable[[str], None]] = None,
     allow_wake: bool = True,
     _pre_wake_hook: Optional[Callable[[], None]] = None,
+    allow_mail: Optional[bool] = None,
 ) -> dict:
-    """Execute one polling tick safely: scan -> rebuild -> publish -> at most 1 live wake."""
+    """Scan, rebuild, publish, then dispatch at most one mail and one wake."""
+    if allow_mail is None:
+        allow_mail = allow_wake
     ensure_non_root()
     runtime_dir = board_lint.verify_runtime_dir(runtime_dir, expected_mode=0o700, create=True)
     clock = now_fn or (lambda: datetime.now(timezone.utc))
@@ -505,7 +534,9 @@ def run_tick(
         now=now,
         allow_missing=not ledger_initialized,
     )
-    mail_ledger, ml_corrupt = wake_routes.MailLedger.load(runtime_dir / MAIL_LEDGER_NAME, now=now)
+    mail_ledger, ml_corrupt = wake_routes.MailLedger.load(
+        runtime_dir / MAIL_LEDGER_NAME, now=now, allow_missing=not ledger_initialized,
+    )
     last_pub, lp_corrupt = _read_last_published(runtime_dir / LAST_PUBLISHED_NAME)
 
     not_bootstrapped = (
@@ -666,7 +697,16 @@ def run_tick(
 
     _write_apfs_json(runtime_dir / HEALTH_NAME, health_rec)
 
-    # 7. Select at most ONE eligible live wake candidate
+    mail_outcome = None
+    if allow_mail and _verify_board_root_pinned(
+        board_dir, snapshot.root_dev, snapshot.root_ino, expected_board_id=manifest_board_id,
+    ):
+        # Lint findings can suppress wakes and still trigger mail.
+        latest_cfg, latest_corrupt = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
+        if not latest_corrupt and latest_cfg["mail"] == route_cfg["mail"]:
+            mail_outcome = _send_next_mail(board_dir, mail_ledger, route_cfg["mail"], mail_digest, clock, emit_log)
+
+    # Select at most one eligible live wake candidate.
     wake_outcome = None
     if allow_wake and not result["health"]["live_dispatch_suppressed"]:
         candidates = []
@@ -719,7 +759,9 @@ def run_tick(
             re_hk, _re_hk_obj, re_hkc = board_state.load_housekeeping_receipts(runtime_dir / HOUSEKEEPING_NAME)
             re_cfg, re_rc = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
             re_wl, re_wlc = wake_routes.WakeLedger.load(runtime_dir / WAKE_LEDGER_NAME, now=recheck_now, allow_missing=False)
-            re_ml, re_mlc = wake_routes.MailLedger.load(runtime_dir / MAIL_LEDGER_NAME, now=recheck_now)
+            _re_ml, re_mlc = wake_routes.MailLedger.load(
+                runtime_dir / MAIL_LEDGER_NAME, now=recheck_now, allow_missing=False,
+            )
             re_lp, re_lpc = _read_last_published(runtime_dir / LAST_PUBLISHED_NAME)
             if (
                 re_manifest is None
@@ -793,7 +835,7 @@ def run_tick(
                 break
 
             re_rcfg = re_cfg["routes"].get(agent, {"adapter": "inbox", "enabled": False})
-            if not re_rcfg.get("enabled") or re_rcfg.get("adapter") == "inbox":
+            if not re_rcfg.get("enabled") or re_rcfg != route_cfg["routes"][agent]:
                 continue
             re_item = next(
                 (it for it in re_res["state"]["inboxes"].get(agent, []) if it["uuid"] == msg_uuid),
@@ -835,6 +877,8 @@ def run_tick(
                     "wake_sent": None,
                 }
 
+            board_parent = Path(board_dir).resolve().parent
+            project_dir = board_parent.parent if board_parent.name == "bridge" else board_parent
             outcome = wake_routes.wake(
                 agent,
                 msg_uuid,
@@ -844,6 +888,7 @@ def run_tick(
                 agy_runner=agy_runner,
                 log_fn=emit_log,
                 require_existing_ledger=True,
+                project_dir=project_dir,
             )
             wake_outcome = {"agent": agent, "uuid": msg_uuid, "outcome": outcome}
             # Refresh mail_pending.json on APFS if wake produced attention state
@@ -879,6 +924,7 @@ def run_tick(
         "healthy": True,
         "result": result,
         "wake_sent": wake_outcome,
+        "mail_sent": mail_outcome,
     }
 
 
@@ -907,6 +953,7 @@ def parse_args(argv=None):
         default=None,
         help="Human approver role name (env: BOARDHUB_HUMAN, default: owner).",
     )
+    parser.add_argument("command", nargs="?", choices=("probe",), help="Check local wake route prerequisites.")
     parser.add_argument("--bootstrap", action="store_true", help="Bootstrap manifest and baseline.")
     parser.add_argument("--once", action="store_true", help="Run a single watcher tick and exit.")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SECONDS, help="Polling interval in seconds.")
@@ -920,6 +967,9 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     os.umask(0o077)
     args = parse_args(argv)
+    if args.command == "probe" and (args.bootstrap or args.once or args.reconcile_manifest or args.housekeep is not None):
+        print("probe cannot be combined with watcher actions.", file=sys.stderr)
+        return 2
     if args.interval < 1:
         print("Polling interval must be >= 1 second.", file=sys.stderr)
         return 2
@@ -929,11 +979,21 @@ def main(argv=None) -> int:
         board_dir, resolved_runtime_dir, _human_role = board_lint.resolve_cli_settings(args)
         if not args.skip_apfs_check:
             verify_apfs_residence(resolved_runtime_dir)
-        runtime_dir = board_lint.verify_runtime_dir(resolved_runtime_dir, expected_mode=0o700, create=True)
+        runtime_dir = board_lint.verify_runtime_dir(resolved_runtime_dir, expected_mode=0o700, create=args.command != "probe")
     except (WatcherError, board_lint.SecurityError, board_lint.FormatError, ValueError, OSError) as exc:
         _syslog_error(f"startup failed: {exc}")
         print(f"BoardHub startup error: {exc}", file=sys.stderr)
         return 2
+
+    if args.command == "probe":
+        config, corrupt = wake_routes.load_route_config(runtime_dir / ROUTES_NAME)
+        results = {} if corrupt else wake_routes.probe_routes(config)
+        ok = not corrupt and all(route["status"] == "ok" for route in results.values())
+        report = {"ok": ok, "routes": results}
+        if corrupt:
+            report["error"] = "invalid_routes"
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if ok else 2
 
     try:
         log_stream = open_validated_log_stream(runtime_dir)

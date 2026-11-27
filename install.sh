@@ -122,6 +122,16 @@ do
     fi
 done
 
+# Preserve the immutability and delivery history of an existing installation.
+if [[ -e "$runtime_dir/manifest.json" || -e "$runtime_dir/baseline.json" || -e "$runtime_dir/last_published.json" ]]; then
+    for name in manifest.json baseline.json wake_ledger.json mail_ledger.json; do
+        if [[ ! -f "$runtime_dir/$name" ]]; then
+            echo "Restore missing runtime state before upgrading: $runtime_dir/$name" >&2
+            exit 1
+        fi
+    done
+fi
+
 jobs=$(launchctl list)
 if awk -v label="$label" '$3 == label { found = 1 } END { exit !found }' <<< "$jobs"; then
     launchctl bootout "gui/$UID/$label"
@@ -164,7 +174,7 @@ chmod 600 "$tmp_plist"
 mv -f "$tmp_plist" "$agent"
 trap - EXIT
 
-if [[ ! -e "$runtime_dir/manifest.json" || ! -e "$runtime_dir/baseline.json" || ! -e "$runtime_dir/wake_ledger.json" ]]; then
+if [[ ! -e "$runtime_dir/manifest.json" ]]; then
     /usr/bin/python3 -I "$runtime_dir/board_watch.py" \
         --board "$board_dir" \
         --runtime-dir "$runtime_dir" \
