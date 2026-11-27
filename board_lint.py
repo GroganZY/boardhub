@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 # --- Protocol constants & configurable human role ---
 
 DEFAULT_HUMAN_ROLE = "owner"
+WEB_USER = "user"
 ACTOR_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 AGENT_PARTICIPANTS = frozenset({
     "claude",
@@ -37,7 +38,7 @@ AGENT_PARTICIPANTS = frozenset({
     "dsh",
 })
 HUMAN_ROLE = DEFAULT_HUMAN_ROLE
-VALID_SENDERS = AGENT_PARTICIPANTS | frozenset({HUMAN_ROLE})
+VALID_SENDERS = AGENT_PARTICIPANTS | frozenset({HUMAN_ROLE, WEB_USER})
 VALID_RECIPIENTS = VALID_SENDERS | frozenset({"all"})
 
 
@@ -56,7 +57,7 @@ def configure_human_role(role: Optional[str] = None) -> str:
     resolved = role if role is not None else (os.environ.get("BOARDHUB_HUMAN") or DEFAULT_HUMAN_ROLE)
     resolved = validate_human_role(resolved)
     HUMAN_ROLE = resolved
-    VALID_SENDERS = AGENT_PARTICIPANTS | frozenset({HUMAN_ROLE})
+    VALID_SENDERS = AGENT_PARTICIPANTS | frozenset({HUMAN_ROLE, WEB_USER})
     VALID_RECIPIENTS = VALID_SENDERS | frozenset({"all"})
     if "board_state" in sys.modules:
         sys.modules["board_state"].INBOX_RECIPIENTS = tuple(sorted(VALID_SENDERS))
@@ -185,6 +186,8 @@ V2_TYPES = REGISTRY_EVENT_TYPES | frozenset({
     "info",
     "question",
     "answer",
+    "decision",
+    "task_update",
 })
 TASK_KINDS = frozenset({"code", "coordination"})
 TASK_STATES = (
@@ -198,6 +201,7 @@ TASK_STATES = (
 )
 TERMINAL_STATES = frozenset({"done", "rejected"})
 STATE_EVENT_VALUES = frozenset({"claimed", "in_progress", "blocked"})
+DECISION_VALUES = frozenset({"approve", "reject", "revise"})
 REVIEW_VERDICTS = frozenset({"approve", "revise", "reject"})
 PREFLIGHT_STATUSES = frozenset({"checked", "not_applicable"})
 
@@ -225,6 +229,10 @@ KNOWN_V2_FIELDS = frozenset(COMMON_V2_REQUIRED) | frozenset(NEEDS_USER_FIELDS) |
     "verdict",
     "checklist",
     "session_id",
+    "decision",
+    "action",
+    "display_name",
+    "related_thread",
 })
 
 MAX_V2_FILE_BYTES = 64 * 1024
@@ -729,6 +737,10 @@ class ParsedV2Message:
     checklist: Optional[Dict[str, dict]]
     body: str
     session_id: Optional[str] = None
+    decision: Optional[str] = None
+    action: Optional[str] = None
+    display_name: Optional[str] = None
+    related_thread: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1056,12 +1068,16 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
         "state": {"state", "re"},
         "delivery": {"delivers", "checklist", "re"},
         "review": {"review_of", "verdict", "re"},
-        "info": {"task", "re"},
+        "info": {"task", "re", "related_thread"},
         "question": {"task", "re"},
         "answer": {"re"},
+        "decision": {"decision"},
+        "task_update": {"action", "assignee"},
         "checkin": {"session_id"},
         "checkout": set(),
     }[msg_type]
+    if sender == WEB_USER:
+        allowed_type_fields.add("display_name")
     extra_keys = set(meta.keys()) - set(COMMON_V2_REQUIRED) - set(NEEDS_USER_FIELDS) - allowed_type_fields
     if extra_keys:
         return None, [_v2_fail("FORMAT", filename, req_id, thread)]
@@ -1074,6 +1090,29 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
     review_of: Optional[dict] = None
     verdict: Optional[str] = None
     checklist: Optional[Dict[str, dict]] = None
+
+    decision = meta.get("decision")
+    action = meta.get("action")
+    display_name = meta.get("display_name")
+    related_thread = meta.get("related_thread")
+    if display_name is not None and (not display_name or len(display_name.encode("utf-8")) > 120):
+        return None, [_v2_fail("FORMAT", filename, req_id, thread)]
+    if related_thread is not None and (
+        sender != WEB_USER or not is_root or related_thread == thread
+        or not UUID_V4_RE.fullmatch(related_thread)
+    ):
+        return None, [_v2_fail("REFERENCE", filename, req_id, thread)]
+    if msg_type in ("decision", "task_update"):
+        if sender != WEB_USER or recipient not in AGENT_PARTICIPANTS | {"all"} or needs_user:
+            return None, [_v2_fail("ROLE", filename, req_id, thread)]
+    if decision is not None and (is_root or decision not in DECISION_VALUES):
+        return None, [_v2_fail("FORMAT", filename, req_id, thread)]
+    if msg_type == "task_update":
+        assignee = meta.get("assignee")
+        if is_root or action not in ("reassign", "close") or recipient not in AGENT_PARTICIPANTS:
+            return None, [_v2_fail("FORMAT", filename, req_id, thread)]
+        if (action == "reassign" and assignee != recipient) or (action == "close" and assignee is not None):
+            return None, [_v2_fail("FORMAT", filename, req_id, thread)]
 
     session_id = meta.get("session_id")
     if msg_type in REGISTRY_EVENT_TYPES:
@@ -1089,7 +1128,7 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
     if msg_type == "task":
         if not is_root:
             return None, [_v2_fail("FORMAT", filename, req_id, thread)]
-        if sender not in ("claude_main", "claude"):
+        if sender not in ("claude_main", "claude", WEB_USER):
             return None, [_v2_fail("ROLE", filename, req_id, thread)]
         for k in ("assignee", "reviewer", "kind"):
             if k not in meta or not meta[k]:
@@ -1199,6 +1238,10 @@ def parse_v2_message(entry: SnapshotEntry) -> Tuple[Optional[ParsedV2Message], L
         checklist=checklist,
         body=body_display,
         session_id=session_id,
+        decision=decision,
+        action=action,
+        display_name=display_name,
+        related_thread=related_thread,
     ), []
 
 

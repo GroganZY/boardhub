@@ -501,8 +501,19 @@ def _send_next_mail(
     submission_id = ledger.begin_submission([item["item_id"]], digest["snapshot_id"], now=now, automatic=True)
     status, code = wake_routes.run_mail_notifier(notifier, item)
     ledger.finish_submission(submission_id, status, now=clock())
-    emit_log(f"ts={digest['as_of']} route=mail item={item['item_id']} status={status} code={code}")
+    thread_id = item.get("thread_id") or "none"
+    emit_log(f"ts={digest['as_of']} route=mail item={item['item_id']} status={status} code={code} thread={thread_id}")
     return {"item_id": item["item_id"], "outcome": status}
+
+
+def _thread_allows_wake(thread, item) -> bool:
+    if not thread:
+        return False
+    if item.get("terminal_notification"):
+        # A human decision or task close can notify its recipient once. All
+        # other messages still respect the paused or terminal conversation.
+        return all(reason == "needs_user" for reason in thread["freeze_reasons"])
+    return not (thread["paused"] or thread["frozen"] or thread["terminal"])
 
 
 def run_tick(
@@ -739,7 +750,7 @@ def run_tick(
                 if item["is_broadcast"] or item["is_baseline"]:
                     continue
                 thr = threads.get(item["thread_id"])
-                if not thr or thr["paused"] or thr["frozen"] or thr["terminal"]:
+                if not _thread_allows_wake(thr, item):
                     continue
                 if not wake_ledger.is_eligible(agent, item["uuid"], now):
                     continue
@@ -868,7 +879,7 @@ def run_tick(
             if re_item is None or re_item["is_broadcast"] or re_item["is_baseline"]:
                 continue
             re_thr = re_res["state"]["threads"].get(re_item["thread_id"])
-            if not re_thr or re_thr["paused"] or re_thr["frozen"] or re_thr["terminal"]:
+            if not _thread_allows_wake(re_thr, re_item):
                 continue
             if not re_wl.is_eligible(agent, msg_uuid, recheck_now):
                 continue

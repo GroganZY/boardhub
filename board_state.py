@@ -581,6 +581,7 @@ def rebuild(
     roots: Dict[str, board_lint.ParsedV2Message] = {}
     children_by_prev: Dict[str, List[board_lint.ParsedV2Message]] = {}
     non_roots_by_uuid: Dict[str, board_lint.ParsedV2Message] = {}
+    decisions_by_thread: Dict[str, List[board_lint.ParsedV2Message]] = {}
 
     for msg_uuid in sorted(valid_by_uuid):
         msg = valid_by_uuid[msg_uuid]
@@ -590,7 +591,10 @@ def rebuild(
             roots[msg_uuid] = msg
         else:
             non_roots_by_uuid[msg_uuid] = msg
-            children_by_prev.setdefault(msg.prev, []).append(msg)
+            if msg.decision is not None:
+                decisions_by_thread.setdefault(msg.thread, []).append(msg)
+            else:
+                children_by_prev.setdefault(msg.prev, []).append(msg)
 
     for prev_id in children_by_prev:
         children_by_prev[prev_id].sort(key=lambda m: m.request_id)
@@ -663,6 +667,10 @@ def rebuild(
             "review_of": msg.review_of,
             "checklist": msg.checklist,
             "supersedes": msg.supersedes,
+            "decision": msg.decision,
+            "action": msg.action,
+            "display_name": msg.display_name,
+            "related_thread": msg.related_thread,
             "body": msg.body,
         })
 
@@ -787,6 +795,7 @@ def rebuild(
         _record_v2_view(root, "accepted")
 
         accepted_types: Dict[str, str] = {root.request_id: root.msg_type}
+        web_recipients = {root.recipient} if root.sender == board_lint.WEB_USER else set()
         event_count = 1
         current_head = root.request_id
         paused = False
@@ -867,6 +876,7 @@ def rebuild(
                     task_kind=task_kind,
                     task_state=task_state,
                     participants=participants,
+                    web_recipients=web_recipients,
                     accepted_types=accepted_types,
                     active_delivery=active_delivery,
                     reviewed_delivery_ids=reviewed_delivery_ids,
@@ -908,11 +918,22 @@ def rebuild(
             _record_v2_view(chosen, "accepted")
             event_count += 1
             current_head = chosen.request_id
+            if chosen.sender == board_lint.WEB_USER:
+                web_recipients.add(chosen.recipient)
 
             revise_paused = False
             if is_task:
                 if chosen.msg_type == "state":
                     task_state = chosen.state
+                elif chosen.msg_type == "task_update":
+                    active_delivery = None
+                    if chosen.action == "close":
+                        task_state = "done"
+                    else:
+                        assignee = chosen.assignee
+                        participants = {creator, assignee} | ({reviewer} if reviewer else set())
+                        task_state = "open"
+                        revise_count = 0
                 elif chosen.msg_type == "delivery":
                     eff_delivers = chosen.delivers if chosen.delivers is not None else {}
                     active_delivery = {
@@ -964,6 +985,31 @@ def rebuild(
                 _open_pending("loop_breaker_30", chosen.request_id, chosen.sent_at)
 
         freeze_list = list(frozen_threads.get(rid, []))
+        # Acknowledgements attach to the pending trigger without extending or reopening
+        # the paused conversation. Replay the first valid response deterministically.
+        for decision in sorted(
+            decisions_by_thread.get(rid, []), key=lambda m: (m.sent_at_dt, m.number, m.filename)
+        ):
+            if (
+                pending_entry is None or pending_entry["reason"] != "needs_user" or freeze_list
+                or decision.prev != pending_entry["trigger_uuid"]
+            ):
+                _reject_msg(decision, "REFERENCE")
+                continue
+            trigger = accepted_chain[-1]
+            expected = trigger.sender if trigger.sender in board_lint.AGENT_PARTICIPANTS else trigger.recipient
+            if expected not in board_lint.AGENT_PARTICIPANTS:
+                expected = "all"
+            if decision.recipient != expected:
+                _reject_msg(decision, "ROLE")
+                continue
+            if "decision_uuid" in pending_entry:
+                _reject_msg(decision, "THREAD_CLOSED")
+                continue
+            pending_entry.update(open=False, decision_uuid=decision.request_id, decision=decision.decision)
+            accepted_uuids.add(decision.request_id)
+            accepted_events_list.append(decision)
+            _record_v2_view(decision, "accepted")
         is_frozen = paused or bool(freeze_list)
         is_terminal = bool(is_task and task_state in board_lint.TERMINAL_STATES)
 
@@ -1084,6 +1130,7 @@ def rebuild(
             "thread_frozen": thr_info["frozen"],
             "thread_terminal": thr_info["terminal"],
             "is_broadcast": msg.recipient == "all",
+            "terminal_notification": msg.decision is not None or msg.action == "close",
             "is_baseline": msg.request_id in known_baseline_uuids,
         }
         if msg.recipient == "all":
@@ -1202,6 +1249,7 @@ def _validate_candidate(
     task_kind: Optional[str],
     task_state: Optional[str],
     participants: Set[str],
+    web_recipients: Set[str],
     accepted_types: Dict[str, str],
     active_delivery: Optional[dict],
     reviewed_delivery_ids: Set[str],
@@ -1262,12 +1310,27 @@ def _validate_candidate(
             return "STALE_REVIEW"
         return None
 
-    if cand.msg_type in ("info", "question", "answer"):
-        if is_task:
+    if cand.msg_type == "task_update":
+        if not is_task:
+            return "TRANSITION"
+        if cand.action == "close":
+            return None if cand.recipient == assignee else "ROLE"
+        if cand.assignee in (assignee, reviewer):
+            return "ROLE"
+        if cand.assignee == "dsh" and task_kind == "code" and reviewer != "codex":
+            return "ROLE"
+        return None
+
+    if cand.msg_type in ("info", "question", "answer", "decision"):
+        if is_task and cand.sender != board_lint.WEB_USER:
+            if cand.recipient == board_lint.WEB_USER and (
+                cand.sender in participants or cand.sender in web_recipients or "all" in web_recipients
+            ):
+                return None
             if cand.sender not in participants:
                 return "ROLE"
             if cand.recipient not in participants:
-                if not (cand.recipient == board_lint.HUMAN_ROLE and cand.needs_user):
+                if not (cand.recipient in {board_lint.HUMAN_ROLE, board_lint.WEB_USER} and cand.needs_user):
                     return "ROLE"
         return None
 
@@ -1704,7 +1767,7 @@ def _find_existing_uuid_files(board_path: Path, message_uuid: str) -> List[str]:
 
 def publish_message(
     board_dir: Path,
-    number: int,
+    number: Optional[int],
     from_agent: str,
     to_agent: str,
     message_uuid: str,
@@ -1714,9 +1777,9 @@ def publish_message(
     _fsync_dir_fn=None,
     _before_publish_hook=None,
 ) -> dict:
-    """Atomically publish a v2 board message with per-UUID retry serialization & conflict detection."""
-    if not isinstance(number, int) or isinstance(number, bool) or not 0 <= number <= 9999:
-        raise PublishError("number must be an integer 0..9999.")
+    """Atomically publish a v2 message. Pass None to allocate the next number under the board lock."""
+    if number is not None and (type(number) is not int or not 0 <= number <= 9999):
+        raise PublishError("number must be None or an integer 0..9999.")
     if from_agent not in board_lint.VALID_SENDERS:
         raise PublishError("Invalid sender actor.")
     if to_agent not in board_lint.VALID_RECIPIENTS:
@@ -1728,7 +1791,8 @@ def publish_message(
     raw = bytes(content_bytes)
 
     board_path = Path(board_dir)
-    final_name = f"{number:04d}_{from_agent}_to_{to_agent}--{message_uuid}.md"
+    suffix = f"_{from_agent}_to_{to_agent}--{message_uuid}.md"
+    final_name = f"{number or 0:04d}{suffix}"
     dummy_entry = board_lint.SnapshotEntry(
         filename=final_name,
         sha256=hashlib.sha256(raw).hexdigest(),
@@ -1752,6 +1816,13 @@ def publish_message(
             existing = _find_existing_uuid_files(board_path, message_uuid)
             if existing:
                 return _verify_existing_publication(board_path, existing, raw, from_agent, to_agent, message_uuid)
+
+            if number is None:
+                last = max((int(name[:4]) for name in os.listdir(board_path)
+                            if re.match(r"^[0-9]{4}_", name)), default=0)
+                if last >= 9999:
+                    raise PublishError("Board message numbers are exhausted.")
+                final_name = f"{last + 1:04d}{suffix}"
 
             tmp_name = f".tmp_{message_uuid}_{os.getpid()}_{secrets.token_hex(6)}.md"
             tmp_path = board_path / tmp_name

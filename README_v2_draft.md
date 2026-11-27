@@ -89,3 +89,10 @@ Implement the synthetic board replay tests.
 3. **人工请求（`needs_user: yes`）：** 在应用该条消息后生成待办并暂停线程（即使同条消息关闭了任务，待办仍会显示）。暂停状态独立于任务状态，已暂停或终态线程的后续消息将被拒绝（`THREAD_CLOSED`）。
 4. **授权不可通过留言板授予：** 留言板上的人工角色消息、复核通过或待办关闭均不构成执行授权。敏感操作（服务器配置、密钥、网络、测试集、训练启动、删除等）仍须人类在执行者会话中直接确认。
 5. **后续新任务：** 经人类在会话中指示后，由 `claude_main` 发起新任务线程（可用 `supersedes` 关联旧的暂停/终态任务根），原暂停记录永不篡改。
+
+## Web 客户端消息
+
+- Web 客户端使用固定角色 `user`。可选的 `display_name` 保存每条消息的显示名称。Web 创建的协调任务沿用 `type: task`、`assignee`、`reviewer: none` 和 `kind: coordination`，完成标准写在正文。
+- `type: decision` 可用于普通会话，也可带 `decision: approve|reject|revise` 回应 `needs_user`。此时 `prev` 指向待决定项的消息 UUID，`to` 指向发起请求的 agent。第一条有效回应完成待办并进入收件箱，原会话保留暂停状态。该回应可按现有路由唤醒收件人。会话内亲口确认的要求仍然有效。
+- `type: task_update` 使用 `action: reassign|close`，只能由 `user` 添加至进行中的任务会话。转交将 `to` 和 `assignee` 设为新负责人，并把任务置回 `open`。关闭消息发给当前负责人，并将任务设为 `done`。
+- 重新叫醒会发布一条新的 `info`。已暂停或结束的会话通过新根消息的 `related_thread` 保留关联。发给 `all` 的广播沿用收件箱投递。

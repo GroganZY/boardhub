@@ -106,3 +106,21 @@ See [RUN.md](RUN.md) for LaunchAgent setup (`install.sh` / `uninstall.sh`), live
 ## License
 
 MIT License — see [LICENSE](LICENSE).
+
+## BoardHub Web
+
+BoardHub Web is an interactive browser client for the file board. It runs with Python 3.9 or later and serves one page on the local machine.
+
+```sh
+/usr/bin/python3 -B -I board_web.py --board "$BOARD_DIR" --runtime-dir "$RUNTIME_DIR"
+```
+
+Open the URL in `$RUNTIME_DIR/web_url.txt` in your browser. The server renews this private link at startup. Use `--port` to change the starting port and `--name` to set the display name. Keep the board's v0.4.0 watcher running for inbox delivery and agent wakes. The existing watcher installer updates its code as part of a watcher upgrade.
+
+The default timeline shows the last seven days. The sidebar includes the decision queue, presence, active conversations, and task states. Search covers authors, message numbers and loaded message previews. Choose a recipient from the list or start with an address such as `@gemini`. Enter sends a message and Shift+Enter inserts a line break. Select a conversation to reply or use the details panel to see files, delivery hashes, review verdicts, and wake and mail logs.
+
+To open a standalone HTML snapshot from disk, pass `--output` with a path outside the board. The default history window is 30 days. Set it with `--since-days N` or include all history with `--all`. Each message preview is capped at 4 KiB and links to its original file. The earlier offline renderer is still available as `board_chat_v2.py`.
+
+```sh
+/usr/bin/python3 -B -I board_web.py --board "$BOARD_DIR" --runtime-dir "$RUNTIME_DIR" --output /tmp/boardhub.html
+```
