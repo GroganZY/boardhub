@@ -5,11 +5,12 @@ from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from http.client import HTTPConnection
 import json
+import os
 from pathlib import Path
 import socket
 import stat
 import tempfile
-from threading import Thread
+from threading import Event, Thread
 import time
 import unittest
 from unittest.mock import patch
@@ -48,6 +49,11 @@ class BoardWebTests(unittest.TestCase):
         self.board = self.root / "board"
         self.runtime = self.root / "runtime"
         self.board.mkdir()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        home = patch.dict(os.environ, {"HOME": str(self.home)})
+        home.start()
+        self.addCleanup(home.stop)
         self.server = web.create_server(self.board, self.runtime, port=0, display_name="协作者")
         self.addCleanup(self.server.server_close)
         self.runner = Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01})
@@ -285,15 +291,273 @@ class BoardWebTests(unittest.TestCase):
         for name, contents in history.items():
             self.assertEqual((self.runtime / name).read_bytes(), contents)
 
+    def test_live_group_config_changes_are_published_on_poll(self):
+        auth = self.login()
+        before = self.get_changes(auth)
+        config = self.runtime / "group.json"
+        group = {"id": "test-team", "name": "测试团队"}
+        lint.atomic_write_private_file(config, json.dumps(group).encode())
+        configured = self.get_changes(auth, before["version"])
+        self.assertEqual(configured["delta"]["group"], group)
+
+        config.unlink()
+        restored = self.get_changes(auth, configured["version"])
+        self.assertEqual(restored["delta"]["group"], {"id": "default", "name": "BoardHub"})
+
+    def test_offline_cli_group_precedence(self):
+        output = self.root / "offline.html"
+        config = self.runtime / "group.json"
+        args = ["--board", str(self.board), "--runtime-dir", str(self.runtime), "--output", str(output)]
+        flags = ["--group-id", "flag-team", "--group-name", "Flag Team"]
+        flag_group = {"id": "flag-team", "name": "Flag Team"}
+        cases = (
+            (None, flags, flag_group),
+            (b'{"id":"incomplete"}', flags, flag_group),
+            (b'{"id":"invalid","name":" "}', flags, flag_group),
+            (b'{"id":"file-team","name":"File Team"}', flags, {"id": "file-team", "name": "File Team"}),
+            (None, flags[:2], {"id": "flag-team", "name": "BoardHub"}),
+            (None, flags[2:], {"id": "default", "name": "Flag Team"}),
+        )
+        for content, options, expected in cases:
+            with self.subTest(content=content, options=options):
+                if content is None:
+                    config.unlink(missing_ok=True)
+                else:
+                    lint.atomic_write_private_file(config, content)
+                with patch("sys.stdout"):
+                    self.assertEqual(web.main(args + options), 0)
+                parsed = EmbeddedScripts()
+                parsed.feed(output.read_text())
+                self.assertEqual(json.loads(parsed.scripts["board-data"])["offline"]["group"], expected)
+
+    def test_contract_without_session_metadata(self):
+        aliases = {
+            "claude": ("claude_code", "main"), "claude_main": ("claude_code", "main"),
+            "claude_side": ("claude_code", "side"), "gemini": ("antigravity", None),
+            "codex": ("codex", None), "gpt": ("codex", "gpt"), "dsh": ("dsh", None),
+            "user": ("grogan", "web"), "grogan": ("grogan", None),
+        }
+        for index, sender in enumerate((*aliases, "other"), 1):
+            (self.board / f"{index:04d}_{sender}_to_all.md").write_text("Legacy body.\n")
+        # Malformed optional records still leave all existing view fields usable.
+        lint.atomic_write_private_file(self.runtime / "registry.json", b'{"roles":[]}')
+        lint.atomic_write_private_file(self.runtime / "wake_ledger.json",
+                                       b'{"records":{"a":null,"b":{"agent":[]}}}')
+        auth = self.login()
+        before = self.get_changes(auth)
+        view = before["reset"]
+        self.assertEqual(view["group"], {"id": "default", "name": "BoardHub"})
+        self.assertEqual([m["id"] for m in view["members"]],
+                         ["claude_code", "antigravity", "codex", "dsh", "grogan"])
+        self.assertTrue(all(m["sessions"] == [] for m in view["members"]))
+        self.assertEqual(view["roles"]["coordinate"],
+                         [{"member": "claude_code", "slot": "main"}, {"member": "claude_code", "slot": "side"}])
+        self.assertEqual(view["roles"]["decide"], [{"member": "grogan"}])
+        self.assertIn("agents", view)
+        for message in view["messages"]:
+            sender = message["from"]
+            with self.subTest(sender=sender):
+                if sender not in aliases:
+                    self.assertNotIn("attribution", message)
+                    continue
+                member, label = aliases[sender]
+                expected = {"member": member, "confidence": "inferred"}
+                if label:
+                    expected["session_label"] = label
+                self.assertEqual(message["attribution"], expected)
+        root, _ = self.seed()
+        delta = self.get_changes(auth, before["version"])
+        self.assertEqual(delta["upsert"][0]["id"], root)
+        self.assertEqual(delta["upsert"][0]["attribution"], {"member": "antigravity", "confidence": "inferred"})
+        self.assertNotIn("members", delta["delta"])
+        old_keys = {"group", "members", "roles"}
+        old_view = {key: value for key, value in view.items() if key not in old_keys}
+        self.server.cache.revisions["old-view"] = old_view
+        self.assertTrue(old_keys <= self.get_changes(auth, "old-view")["delta"].keys())
+
+    def test_discovery_refresh_delivers_members_delta_after_a_source_failure(self):
+        import session_discovery
+
+        project = self.root.resolve() / "project"
+        board = project / "board"
+        board.mkdir(parents=True)
+        runtime = self.root / "discovery-runtime"
+        session_id = str(web.uuid4())
+        source = self.home / ".claude" / "sessions" / "42.json"
+        source.parent.mkdir(parents=True)
+        source.write_text(json.dumps({"sessionId": session_id, "name": "New session", "cwd": str(project)}))
+        entered, release, failed = Event(), Event(), Event()
+        scan = session_discovery.discover_sessions
+
+        def discover(**kwargs):
+            if kwargs["project_dir"] != project:
+                return scan(**kwargs)
+            if not entered.is_set():
+                entered.set()
+                release.wait(3)
+                return scan(**kwargs)
+            failed.set()
+            raise RuntimeError("synthetic discovery failure")
+
+        with patch.object(session_discovery, "discover_sessions", side_effect=discover), \
+                patch.object(web.data, "DISCOVERY_INTERVAL", 0.02), \
+                web.create_server(board, runtime, port=0) as server, \
+                patch.object(self, "server", server), patch.object(self, "runtime", runtime):
+            self.assertTrue(entered.wait(1))
+            try:
+                start = time.monotonic()
+                auth = self.login()
+                before = self.get_changes(auth)
+                self.assertLess(time.monotonic() - start, 1)
+                self.assertEqual(before["reset"]["members"][0]["sessions"], [])
+            finally:
+                release.set()
+            self.assertTrue(failed.wait(2))
+            changes = self.get_changes(auth, before["version"])
+            session, = changes["delta"]["members"][0]["sessions"]
+            self.assertEqual((session["id"], session["label"]), (session_id, "New session"))
+            self.assertNotIn("source", session)
+            self.assertEqual(changes["upsert"], [])
+            self.assertFalse(self.get_changes(auth, changes["version"])["changed"])
+
+    def test_contract_explicit_legacy_headers_are_optional(self):
+        notes = {
+            "0001_gemini_to_claude.md": ("member: antigravity\nsession_id: agy-1\nsession_label: G01 design\n"
+                                       "model: gemini-4-carbon-medium\nsender_role: literature"),
+            "0002_gemini_to_claude.md": "member: codex\nsession_id: /bad/path\nmodel: unsafe model\neffort: unknown",
+            "0003_grogan_to_claude.md": "type: decision",
+            "0004_dsh_to_claude.md": "type: report\nsender_role: decide",
+        }
+        for filename, headers in notes.items():
+            (self.board / filename).write_text(f"---\n{headers}\n---\n\nLegacy body.\n")
+        view = self.get_changes(self.login())["reset"]
+        by_number = {row["number"]: row["attribution"] for row in view["messages"]}
+        self.assertEqual(by_number["0001"], {
+            "member": "antigravity", "session_id": "agy-1", "session_label": "G01 design",
+            "model": "gemini-4-carbon", "effort": "medium", "role": "literature", "confidence": "explicit",
+        })
+        self.assertEqual(by_number["0002"], {"member": "antigravity", "confidence": "inferred"})
+        self.assertEqual(by_number["0003"], {"member": "grogan", "role": "decide", "confidence": "inferred"})
+        self.assertEqual(by_number["0004"], {"member": "dsh", "confidence": "inferred"})
+        self.assertTrue(all(not member["sessions"] for member in view["members"]))
+
+    def test_v2_registry_timeline_and_wake_ledger_attribution(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+
+        def at(seconds):
+            return lint.format_utc_rfc3339(now + timedelta(seconds=seconds))
+
+        def write(number, sender, recipient, kind, seconds, extra=""):
+            message = str(web.uuid4())
+            path = self.board / f"{number:04d}_{sender}_to_{recipient}--{message}.md"
+            path.write_text(
+                f"---\nv: 2\nfrom: {sender}\nto: {recipient}\ntype: {kind}\nrequest_id: {message}\n"
+                f"thread: {message}\nprev: none\nsent_at: {at(seconds)}\nneeds_user: no\n{extra}---\n\nBody.\n"
+            )
+            return message
+
+        early = write(1, "gemini", "codex", "info", -500)
+        checkin = write(2, "gemini", "all", "checkin", -400, "session_id: agy-checked-in\n")
+        during = write(3, "gemini", "codex", "info", -300)
+        write(4, "gemini", "all", "checkout", -200)
+        after = write(5, "gemini", "codex", "info", -150)
+        write(6, "gemini", "all", "checkin", -60, "session_id: agy-current\n")
+        write(7, "claude_side", "all", "checkin", -90000, f"session_id: {web.uuid4()}\n")
+        write(8, "claude_main", "all", "checkin", -400, f"session_id: {web.uuid4()}\n")
+        registry_path = self.runtime / "registry.json"
+        registry, _ = web.data.wake_routes.RoleRegistry.load(registry_path)
+        registry.sync(self.replay()["registry_events"], now)
+
+        # A registry-only check-in still applies when its source is absent locally.
+        message = write(9, "claude_side", "codex", "info", -30)
+        next(self.board.glob("0007_*.md")).unlink()
+
+        thread = write(10, "codex", "user", "info", -10)
+        other_thread = write(11, "codex", "user", "info", -10)
+        session_id = str(web.uuid4())
+        wake_path = self.runtime / "wake_ledger.json"
+        trigger = str(web.uuid4())
+        record = {
+            "agent": "codex", "message_uuid": trigger, "status": "accepted", "last_attempt_at": at(-240),
+            "spawn": {"adapter": "codex", "thread_id": thread, "session_id": session_id,
+                      "model": "gpt-6.2-astra", "effort": "xhigh"},
+            "attempts": [{"outcome": "accepted", "at": at(-240), "finished_at": at(-1)}],
+        }
+        # A later attempt on the same thread is too new to attribute its message.
+        newer_trigger = str(web.uuid4())
+        newer = {**record, "message_uuid": newer_trigger, "last_attempt_at": at(-8), "attempts": [],
+                 "spawn": {**record["spawn"], "session_id": str(web.uuid4()), "model": "gpt-6.2-sol"}}
+        lint.atomic_write_private_file(wake_path, json.dumps({
+            "version": 2, "records": {f"codex:{trigger}": record, f"codex:{newer_trigger}": newer},
+        }).encode())
+        before = {path: path.read_bytes() for path in (registry_path, wake_path)}
+        view = self.get_changes(self.login())["reset"]
+        rows = {row["id"]: row["attribution"] for row in view["messages"]}
+        for uuid in (early, after, other_thread):
+            self.assertEqual(rows[uuid]["confidence"], "inferred")
+            self.assertNotIn("session_id", rows[uuid])
+        self.assertEqual(rows[checkin]["confidence"], "explicit")
+        self.assertEqual(rows[during], {
+            "member": "antigravity", "session_id": "agy-checked-in", "session_label": "default",
+            "confidence": "registry",
+        })
+        self.assertEqual(rows[message]["confidence"], "registry")
+        self.assertEqual(rows[thread], {
+            "member": "codex", "session_id": session_id, "session_label": "#" + session_id[:8],
+            "model": "gpt-6.2-astra", "effort": "xhigh", "confidence": "registry",
+        })
+        members = {member["id"]: member["sessions"] for member in view["members"]}
+        self.assertEqual(members["antigravity"], [{
+            "id": "agy-current", "label": "default", "status": "live",
+            "last_seen": at(-60), "source": "registry",
+        }])
+        self.assertEqual([row["status"] for row in members["claude_code"]], ["idle", "stale"])
+        self.assertEqual(members["codex"][0]["source"], "wake_ledger")
+        self.assertEqual(members["codex"][0]["last_seen"], at(-1))
+        self.assertEqual(len(members["codex"]), 2)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+        write(12, "gemini", "all", "checkin", -5, "session_id: agy-board-only\n")
+        discovered = {
+            "antigravity": [
+                {"id": "agy-current", "label": "Discovery title", "status": "stale",
+                 "last_seen": at(0), "model": "gemini-4-carbon"},
+                {"id": "agy-checked-in", "status": "live", "last_seen": at(0)},
+                {"id": "agy-board-only", "status": "stale", "last_seen": at(-600)},
+                {"id": "agy-discovery-only", "status": "idle", "last_seen": at(0)},
+                {"id": "agy-unknown-time", "status": "stale"},
+            ],
+            "codex": [{"id": session_id, "status": "stale", "model": "discovery-model"}],
+        }
+        view, _ = web.data.build_view(self.replay(), self.runtime, now, None, "user", discovered=discovered)
+        members = {member["id"]: member["sessions"] for member in view["members"]}
+        self.assertEqual([row["id"] for row in members["antigravity"]], [
+            "agy-checked-in", "agy-discovery-only", "agy-current", "agy-board-only", "agy-unknown-time",
+        ])
+        agy = {row["id"]: row for row in members["antigravity"]}
+        self.assertEqual(agy["agy-current"], {
+            "id": "agy-current", "label": "default", "status": "live", "last_seen": at(-60),
+            "source": "registry", "model": "gemini-4-carbon",
+        })
+        self.assertEqual(agy["agy-checked-in"]["status"], "stale")
+        self.assertEqual(agy["agy-board-only"]["status"], "live")
+        self.assertNotIn("source", agy["agy-discovery-only"])
+        self.assertEqual(len(members["codex"]), 2)
+        self.assertEqual(members["codex"][0]["status"], "live")
+        self.assertEqual(members["codex"][0]["model"], "gpt-6.2-astra")
+
     def test_offline_grouping_history_and_786_message_budget(self):
         body = ("汉字与普通消息 " * 850).encode()
         for number in range(1, 787):
             meta = "re: 0001\n" if number > 1 else ""
             filename = self.board / f"{number:04d}_gemini_to_user.md"
             filename.write_bytes((f"---\nfrom: gemini\nto: user\n{meta}---\n\n").encode() + body)
-        import os
         stale = (datetime.now(timezone.utc) - timedelta(days=40)).timestamp()
         os.utime(self.board / "0786_gemini_to_user.md", (stale, stale))
+        source = self.home / ".claude" / "sessions" / "42.json"
+        source.parent.mkdir(parents=True)
+        session_id = str(web.uuid4())
+        source.write_text(json.dumps({"sessionId": session_id, "name": "Offline session"}))
         output = self.root / "offline.html"
         start = time.perf_counter()
         size = web.export_page(self.board, self.runtime, output, None, "用户")
@@ -303,6 +567,8 @@ class BoardWebTests(unittest.TestCase):
         parsed = EmbeddedScripts()
         parsed.feed(output.read_text())
         view = json.loads(parsed.scripts["board-data"])["offline"]
+        self.assertEqual(view["group"], {"id": "default", "name": "BoardHub"})
+        self.assertEqual(view["members"][0]["sessions"][0]["id"], session_id)
         self.assertEqual(len(view["messages"]), 786)
         self.assertEqual(len(view["threads"]), 1)
         self.assertTrue(all(row["more"] and len(row["body"].encode()) <= 4096 for row in view["messages"]))

@@ -82,12 +82,21 @@ class Page:
         return markup.encode("utf-8"), csp + "; frame-ancestors 'none'"
 
 
-def export_page(board, runtime, output, since_days, display_name):
+def export_page(board, runtime, output, since_days, display_name, *, include_mainline=False, group_fallback=None):
+    output = Path(output)
+    if output.parent.resolve().is_relative_to(Path(board).resolve()):
+        raise ValueError("Choose an export path outside the board.")
     now = datetime.now(timezone.utc)
     result = data.read_board(board, runtime, now)
     if not result["health"]["healthy"] or result["health"]["runtime_corrupt"]:
         raise ValueError("Board scan unavailable.")
-    view, bodies = data.build_view(result, runtime, now, since_days, display_name)
+    discovered = data.read_discovered_sessions(board)
+    dispatches = [] if include_mainline else None
+    view, bodies = data.build_view(result, runtime, now, since_days, display_name,
+                                  discovered=discovered, dispatches=dispatches, group_fallback=group_fallback)
+    if include_mainline:
+        references = data.claude_transcript.BoardReferences(view["messages"], dispatches)
+        view["mainline"] = data.read_mainline(data.new_mainline_reader(), runtime, references, now, since_days)
     view["board_url"] = Path(board).resolve().as_uri()
     page = Page()
     html, _ = page.render({"offline": view}, offline=True)
@@ -98,9 +107,11 @@ def export_page(board, runtime, output, since_days, display_name):
         for row in view["messages"]:
             row["body"], row["more"] = data._preview(bodies[row["path"]], limit)
         html, _ = page.render({"offline": view}, offline=True)
-    output = Path(output)
-    if output.parent.resolve().is_relative_to(Path(board).resolve()):
-        raise ValueError("Choose an export path outside the board.")
+    if include_mainline:
+        items = view["mainline"]["items"]
+        while len(html) >= data.PAGE_LIMIT and items:
+            del items[:max(1, len(items) // 8)]
+            html, _ = page.render({"offline": view}, offline=True)
     board_lint.atomic_write_private_file(output, html)
     return len(html)
 
@@ -379,20 +390,24 @@ class WebHandler(BaseHTTPRequestHandler):
 class WebServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
-    def __init__(self, port, board, runtime, since_days, display_name):
+    def __init__(self, port, board, runtime, since_days, display_name, *, group_fallback=None):
         self.token, self.session, self.csrf = (secrets.token_urlsafe(32) for _ in range(3))
         self.index = Page().render({"csrf": self.csrf})
-        self.cache = data.BoardView(board, runtime, since_days, display_name)
+        self.cache = data.BoardView(board, runtime, since_days, display_name, group_fallback=group_fallback)
         self.lock = RLock()
         super().__init__(("127.0.0.1", port), WebHandler)
 
+    def server_close(self):
+        self.cache.discovery_stop.set()
+        super().server_close()
 
-def create_server(board, runtime, port=8765, since_days=30, display_name="user"):
+
+def create_server(board, runtime, port=8765, since_days=30, display_name="user", *, group_fallback=None):
     display_name = field({"name": display_name}, "name", 120)
     runtime = board_lint.verify_runtime_dir(Path(runtime), create=True)
     for candidate in (range(port, 65536) if port else (0,)):
         try:
-            server = WebServer(candidate, board, runtime, since_days, display_name)
+            server = WebServer(candidate, board, runtime, since_days, display_name, group_fallback=group_fallback)
         except OSError as exc:
             if exc.errno != errno.EADDRINUSE:
                 raise
@@ -400,6 +415,7 @@ def create_server(board, runtime, port=8765, since_days=30, display_name="user")
             url = f"http://127.0.0.1:{server.server_port}/?t={server.token}"
             try:
                 board_lint.atomic_write_private_file(runtime / "web_url.txt", (url + "\n").encode("ascii"))
+                server.cache.start_discovery()
             except BaseException:
                 server.server_close()
                 raise
@@ -416,14 +432,21 @@ def main(argv=None):
         parser.add_argument("--human")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--name", default="user", help="Display name for messages from user.")
+    parser.add_argument("--group-id", help="Group ID if runtime group.json is unavailable.")
+    parser.add_argument("--group-name", help="Group name if runtime group.json is unavailable.")
     history = parser.add_mutually_exclusive_group()
     history.add_argument("--since-days", type=int, default=30)
     history.add_argument("--all", action="store_true")
     parser.add_argument("--output", type=Path, help="Export a read-only offline HTML file.")
+    parser.add_argument("--include-mainline", action="store_true",
+                        help="Include the private mainline in an offline export.")
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535 or not 1 <= args.since_days <= 36500:
         parser.error("port must be 0–65535 and since-days must be 1–36500")
+    if args.include_mainline and not args.output:
+        parser.error("--include-mainline requires --output")
     since_days = None if args.all else args.since_days
+    group_fallback = {"id": args.group_id, "name": args.group_name}
     try:
         name = field({"name": args.name}, "name", 120)
         if hasattr(board_lint, "resolve_cli_settings"):
@@ -432,10 +455,11 @@ def main(argv=None):
             board = args.board or data.board_watch.DEFAULT_BOARD_DIR
             runtime = args.runtime_dir or data.board_watch.DEFAULT_RUNTIME_DIR
         if args.output:
-            size = export_page(board, runtime, args.output, since_days, name)
+            size = export_page(board, runtime, args.output, since_days, name,
+                               include_mainline=args.include_mainline, group_fallback=group_fallback)
             print(f"Generated {args.output} ({size:,} bytes)")
             return 0
-        with create_server(board, runtime, args.port, since_days, name) as server:
+        with create_server(board, runtime, args.port, since_days, name, group_fallback=group_fallback) as server:
             print(f"BoardHub Web is listening on 127.0.0.1:{server.server_port}. Open {runtime / 'web_url.txt'}.", flush=True)
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, lambda _sig, _frame: Thread(target=server.shutdown, daemon=True).start())

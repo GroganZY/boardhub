@@ -1,0 +1,6 @@
+{
+  "sessions": [
+    {"label": "main", "match": {"desktop_id": "local_<main-desktop-uuid>"}},
+    {"label": "side", "match": {"desktop_id": "local_<side-desktop-uuid>"}}
+  ]
+}

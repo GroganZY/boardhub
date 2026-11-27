@@ -14,6 +14,7 @@
     <button type="button" class="mobile utility" id="nav-toggle" aria-controls="sidebar" aria-expanded="false" aria-label="侧栏">☰</button>
     <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
     <span>BoardHub</span>
+    <span class="group-name" id="group-name" title="当前群聊">群聊</span>
   </div>
   <div class="top-status" id="top-status" aria-label="服务状态"></div>
   <div class="top-tools">
@@ -27,22 +28,25 @@
     <div class="sidebar-scroll">
       <div class="quick">
         <button type="button" class="nav-row decision-nav" id="decisions-nav"><span class="nav-icon" aria-hidden="true">◇</span><span>待你决定</span><span class="number-pill" id="decision-count">0</span></button>
-        <button type="button" class="nav-row" id="recent-nav"><span class="nav-icon" aria-hidden="true">≡</span><span>最近 7 天全部消息</span></button>
+        <button type="button" class="nav-row" id="mainline-nav"><span class="nav-icon" aria-hidden="true">◎</span><span>主线</span></button>
+        <button type="button" class="nav-row" id="overview-nav"><span class="nav-icon" aria-hidden="true">▦</span><span>群聊概览</span></button>
+        <button type="button" class="nav-row" id="recent-nav"><span class="nav-icon" aria-hidden="true">≡</span><span>全部消息</span></button>
       </div>
       <section class="nav-section" aria-labelledby="agents-title"><h2 id="agents-title">成员</h2><div id="agents"></div></section>
-      <section class="nav-section" aria-labelledby="threads-title"><h2 id="threads-title">会话</h2><div id="threads"></div></section>
+      <section class="nav-section" aria-labelledby="threads-title"><h2 id="threads-title">话题</h2><div id="threads"></div></section>
       <section class="nav-section" aria-labelledby="filters-title"><h2 id="filters-title">任务状态</h2><div id="filters"></div></section>
     </div>
     <footer id="updated" class="sidebar-footer"></footer>
   </aside>
   <main class="conversation">
     <header class="conversation-head">
-      <div class="conversation-heading"><h1 id="view-title">最近 7 天全部消息</h1><p id="view-caption"></p></div>
+      <div class="conversation-heading"><h1 id="view-title">群聊概览</h1><p id="view-caption"></p></div>
+      <div class="view-tools" id="view-tools"></div>
       <button type="button" class="secondary" id="new-message">新消息</button>
     </header>
-    <div class="attention-banner"><span aria-hidden="true">◇</span><p>这里的决定会通知各 agent；涉及测试集、下载、服务器配置、删除的操作，仍需你在执行它的那个会话里亲口确认。</p></div>
     <div id="timeline" class="timeline" tabindex="0" aria-label="消息时间线"><div id="messages" class="messages"><p class="empty">正在读取看板…</p></div></div>
     <div class="composer-area">
+      <p id="mainline-hint" class="readonly-hint" hidden>主线只读。在 Claude 桌面版里继续对话。</p>
       <form id="composer" class="composer" hidden>
         <div class="composer-head">
           <strong id="sending-as"></strong>
@@ -60,8 +64,8 @@
     </div>
   </main>
   <aside class="inspector" id="inspector" aria-labelledby="inspector-title">
-    <header class="inspector-head"><h2 id="inspector-title">会话详情</h2><button type="button" class="mobile utility" id="detail-close" aria-label="关闭详情">×</button></header>
-    <div id="details" class="details"><p class="subtle">选择会话或一条消息以查看详情。</p></div>
+    <header class="inspector-head"><h2 id="inspector-title">话题详情</h2><button type="button" class="mobile utility" id="detail-close" aria-label="关闭详情">×</button></header>
+    <div id="details" class="details"><p class="subtle">选择话题或一条消息以查看详情。</p></div>
   </aside>
 </div>
 <dialog id="file-dialog" aria-labelledby="file-name"><div class="dialog-head"><h2 id="file-name"></h2><form method="dialog"><button class="secondary" type="submit">关闭</button></form></div><div id="file-content"></div></dialog>
